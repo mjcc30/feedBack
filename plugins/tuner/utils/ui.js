@@ -3,6 +3,12 @@ window._tunerUI = function(state, actions) {
     let _lastAutoTargetFreq = null;
     let _lastTuningRef = null;
 
+    // When the panel is embedded into a host container (the note-detect
+    // calibration wizard's tuner step), this holds that container.
+    // positionPanel() leaves the panel alone while embedded; unembed()
+    // restores the normal floating behaviour.
+    let _embedHost = null;
+
     // Octave-aware nearest-string match. YIN frequently reports a sub-octave on
     // low strings (D1 instead of D2) and a common sub-harmonic on polyphonic
     // plucks (D+G together → G0), which a raw-distance match snaps to the wrong
@@ -758,6 +764,9 @@ window._tunerUI = function(state, actions) {
 
     function positionPanel() {
         if (!state.uiContainer) return;
+        // Embedded (e.g. inside the calibration wizard): the host owns the
+        // layout — never re-anchor or reposition the panel while embedded.
+        if (_embedHost && state.uiContainer.parentElement === _embedHost) return;
         const isPlayer = document.getElementById('player')?.classList.contains('active');
         const playerEl = document.getElementById('player');
         const wrap = document.getElementById('v3-tuner-wrap');
@@ -808,6 +817,42 @@ window._tunerUI = function(state, actions) {
             .replace('fixed', 'absolute')
             .trim();
         state.uiContainer.style.cssText = 'top:100%;right:0;margin-top:8px';
+    }
+
+    // ── Embedding (calibration-wizard integration) ──────────────────────────
+    // The panel normally floats (fixed/absolute, anchored to the Plugins
+    // popover or the viewport). embedInto() reparents it into a host container
+    // and neutralizes the floating positioning so it renders inline; unembed()
+    // restores the floating panel. The note-detect calibration wizard uses this
+    // to keep the tuner INSIDE the wizard step instead of hiding the wizard.
+    // Callers enable() the tuner first — embedInto() only moves/restyles.
+    function embedInto(container) {
+        if (!state.uiContainer || !(container instanceof Element)) return false;
+        _embedHost = container;
+        const panel = state.uiContainer;
+        // Inline overrides win over the Tailwind fixed/w-72/z-[1000] classes.
+        // positionPanel() skips repositioning while embedded (guard above), so
+        // these survive until unembed() clears them via cssText.
+        panel.style.position = 'static';
+        panel.style.width = '100%';
+        panel.style.maxWidth = '100%';
+        panel.style.zIndex = 'auto';
+        panel.style.left = 'auto';
+        panel.style.right = 'auto';
+        panel.style.top = 'auto';
+        panel.style.bottom = 'auto';
+        panel.style.margin = '0';
+        container.appendChild(panel);
+        return true;
+    }
+
+    function unembed() {
+        if (!_embedHost || !state.uiContainer) return;
+        _embedHost = null;
+        const panel = state.uiContainer;
+        panel.style.cssText = '';
+        if (panel.parentElement !== document.body) document.body.appendChild(panel);
+        positionPanel();
     }
 
     function addButton() {
@@ -885,6 +930,10 @@ window._tunerUI = function(state, actions) {
     return {
         initUI,
         positionPanel,
+        embedInto,
+        unembed,
+        isEmbedded: () => !!(_embedHost && state.uiContainer
+            && state.uiContainer.parentElement === _embedHost),
         renderInstrumentOptions,
         renderTuningOptions,
         renderStringNotes,

@@ -672,7 +672,10 @@
         // library / Esc).
         if (!auto) {
             if (_outsideClickClose) document.removeEventListener('click', _outsideClickClose);
-            _outsideClickClose = () => { if (_state.enabled) disable(); };
+            // Embedded (calibration wizard): the panel lives inside the host's
+            // own surface — a stray click there must not close the tuner. The
+            // × button stays the explicit close.
+            _outsideClickClose = () => { if (_state.enabled && !window.tuner.isEmbedded()) disable(); };
             setTimeout(() => { if (_outsideClickClose) document.addEventListener('click', _outsideClickClose, { once: true }); }, 0);
         }
 
@@ -757,6 +760,11 @@
         enable,
         disable,
         toggle: () => _state.enabled ? disable() : enable(),
+        // Embed the panel into a host container (calibration wizard tuner
+        // step) / restore the floating panel. No-ops on a downlevel UI build.
+        embedInto: (container) => (_tunerUIApi && _tunerUIApi.embedInto(container)) || false,
+        unembed: () => { if (_tunerUIApi) _tunerUIApi.unembed(); },
+        isEmbedded: () => !!(_tunerUIApi && _tunerUIApi.isEmbedded && _tunerUIApi.isEmbedded()),
         updateButtons: () => {
             _tunerUIApi?.updateFloatingButton();
             _tunerUIApi?.updatePlayerButton();
