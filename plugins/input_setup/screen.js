@@ -126,44 +126,210 @@
                 return renderMidiPanel(inst);
             }
 
-            // Guitar/bass: show the audio source (audio-input) and launch the
-            // note_detect Calibration Wizard for the deep work.
+            // Guitar/bass: pick the audio source (audio-input), APPLY it to the
+            // native engine on desktop (device + rate + buffer + monitoring prefs,
+            // persisted), confirm the guitar is audible (live meter), then launch
+            // the note_detect Calibration Wizard for the deep work (tuner / noise
+            // floor / low-E & open-A / timing).
             async function renderAudioPanel(inst) {
                 const { sources, selected } = await _audioSources();
-                const opts2 = sources.map((s) =>
-                    '<option value="' + esc(s.logicalSourceKey || s.sourceId || '') + '"' + (s.selected ? ' selected' : '') + '>' + esc(s.label || 'Input') + '</option>').join('');
-                const hasDetector = !!(window.noteDetect && typeof window.noteDetect.launchCalibration === 'function');
-                const body =
-                    '<p class="text-sm text-fb-textDim">Pick your audio input, then run the calibration to set levels, channel and latency.</p>' +
-                    (sources.length
-                        ? '<label class="block text-xs uppercase tracking-wider text-fb-textDim mt-3 mb-1">Audio input</label>' +
-                          '<select data-is-audio class="w-full bg-gray-800/50 border border-gray-700 rounded-md px-2 py-1.5 text-sm text-fb-text outline-none">' + opts2 + '</select>'
-                        : '<p class="text-sm text-fb-accent mt-2">No audio input detected yet — plug in your interface, or skip and set this up later.</p>') +
-                    (hasDetector ? '' : '<p class="text-xs text-fb-textDim mt-3">The note detector isn’t loaded here — you can calibrate later from the player.</p>');
-                const foot =
-                    '<button type="button" data-is-cal class="bg-fb-primary hover:bg-fb-primaryHi text-white px-5 py-2 rounded-md font-medium">' +
-                    (hasDetector ? 'Calibrate' : 'Continue') + '</button>';
-                shell(inst, body, foot);
+                const desktopApi = (window.feedBackDesktop && window.feedBackDesktop.audio) || null;
+                const canDriveEngine = !!(desktopApi
+                    && typeof desktopApi.setDevice === 'function'
+                    && typeof desktopApi.startAudio === 'function');
+                // The note detector plugin registers late (its screen.js is a huge
+                // deferred surface), so don't test it once at render time: wait
+                // (bounded) and upgrade the button in place when it lands.
+                let detectorReady = !!(window.noteDetect && typeof window.noteDetect.launchCalibration === 'function');
 
-                const sel = host.querySelector('[data-is-audio]');
+                const sourceLabel = (key) => {
+                    const s = sources.find((x) => (x.logicalSourceKey || x.sourceId) === key);
+                    return s ? (s.label || 'Input') : 'Input';
+                };
                 const commitAudio = (key) => {
                     if (!capabilities || !key) return;
                     capabilities.command('audio-input', 'select-source', { requester: 'input_setup', payload: { logicalSourceKey: key } }).catch(() => {});
                 };
-                if (sel) {
-                    sel.addEventListener('change', () => commitAudio(sel.value));
-                    // The <select> shows its first option by default, but no `change`
-                    // fires for that implicit pick — so on a first run with nothing yet
-                    // selected, audio-input would calibrate against the wrong/no source.
-                    // Commit the shown option up-front so the displayed device is the
-                    // one calibrated (idempotent if it was already selected).
-                    if (!selected) commitAudio(sel.value);
-                }
                 // Tell the tuner tables / note_detect which instrument this is.
                 try { fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ instrument: inst }) }); } catch (_) {}
 
-                host.querySelector('[data-is-cal]').addEventListener('click', () => {
-                    if (hasDetector) {
+                // ── desktop: bind the picked source to the native engine ─────
+                // Mirrors the audio_engine panel's Apply: resolve the driver type
+                // and device from the logical source key, probe the supported
+                // rates/buffers, open at 48 kHz / smallest supported buffer
+                // (reusing the persisted rate/buffer when the saved config
+                // describes the same input), make monitoring audible unless a
+                // saved pref says otherwise, start the engine, and PERSIST so the
+                // Audio screen and every later open converge on this config.
+                const normKeyPart = (s) => String(s || 'default')
+                    .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'default';
+                async function applySourceToEngine(key) {
+                    if (!canDriveEngine || !key) return false;
+                    const nameMatch = /^desktop-audio:([^:]+):input:name:(.+)$/.exec(key);
+                    const indexMatch = nameMatch ? null : /^desktop-audio:([^:]+):input:(\d+)$/.exec(key);
+                    if (!nameMatch && !indexMatch) return false;
+                    const typeKey = nameMatch ? nameMatch[1] : indexMatch[1];
+                    let types = [];
+                    try { types = (await desktopApi.getDeviceTypes()) || []; } catch (_) { return false; }
+                    const typeInfo = types.find((t) => t && normKeyPart(t.name) === typeKey) || null;
+                    if (!typeInfo || !typeInfo.name) return false;
+                    const inputs = Array.isArray(typeInfo.inputs) ? typeInfo.inputs : [];
+                    let inputDevice = '';
+                    if (nameMatch) {
+                        let decoded = '';
+                        try { decoded = decodeURIComponent(nameMatch[2]); } catch (_) { decoded = ''; }
+                        inputDevice = inputs.find((n) => String(n).trim() === decoded) || '';
+                    } else {
+                        const i = Number(indexMatch[2]);
+                        inputDevice = (i >= 0 && i < inputs.length) ? inputs[i] : '';
+                    }
+                    if (!inputDevice) return false;
+                    // Duplex on the same physical device when the driver type
+                    // exposes an output under the same name.
+                    const outputs = Array.isArray(typeInfo.outputs) ? typeInfo.outputs : [];
+                    const outputDevice = outputs.find((n) => String(n).trim() === String(inputDevice).trim())
+                        || outputs[0] || '';
+                    let probe = null;
+                    try {
+                        probe = await desktopApi.probeDeviceOptions(typeInfo.name, inputDevice, typeInfo.name, outputDevice);
+                    } catch (_) { probe = null; }
+                    const rates = (probe && Array.isArray(probe.sampleRates) && probe.sampleRates.length)
+                        ? probe.sampleRates.map(Number).filter(Number.isFinite) : [48000];
+                    const bufs = (probe && Array.isArray(probe.bufferSizes) && probe.bufferSizes.length)
+                        ? probe.bufferSizes.map(Number).filter(Number.isFinite) : [256];
+                    let saved = null;
+                    try { saved = await desktopApi.loadDeviceSettings(); } catch (_) { saved = null; }
+                    const savedMatches = !!(saved
+                        && typeof saved.input === 'string'
+                        && saved.input.trim() === String(inputDevice).trim()
+                        && String(saved.inputType || saved.type || '') === String(typeInfo.name));
+                    let sampleRate = rates.includes(48000) ? 48000 : rates[0];
+                    let bufferSize = Math.min.apply(null, bufs);
+                    if (savedMatches) {
+                        if (rates.includes(Number(saved.sampleRate))) sampleRate = Number(saved.sampleRate);
+                        if (bufs.includes(Number(saved.bufferSize))) bufferSize = Number(saved.bufferSize);
+                    }
+                    const inputChannel = savedMatches && Number.isFinite(Number(saved.inputChannel))
+                        ? Number(saved.inputChannel) : -1;
+                    // Fresh profile → monitoring AUDIBLE (the native engine boots
+                    // muted); a saved preference always wins.
+                    const monitorMute = saved && typeof saved.monitorMute === 'boolean' ? saved.monitorMute : false;
+                    const monitorKill = saved && typeof saved.monitorKill === 'boolean' ? saved.monitorKill : false;
+                    const settings = {
+                        type: typeInfo.name,
+                        inputType: typeInfo.name,
+                        outputType: typeInfo.name,
+                        input: inputDevice,
+                        output: outputDevice,
+                        sampleRate: String(sampleRate),
+                        bufferSize: String(bufferSize),
+                        inputChannel: String(inputChannel),
+                        monitorMute,
+                        monitorKill,
+                        savedAt: Date.now(),
+                    };
+                    const persist = async () => {
+                        try {
+                            if (typeof desktopApi.saveDeviceSettings === 'function') {
+                                await desktopApi.saveDeviceSettings(settings);
+                            }
+                        } catch (_) {}
+                    };
+                    // If the engine already runs with exactly this device, don't
+                    // tear it down (a redundant setDevice stops/starts the stream);
+                    // converge the monitoring prefs and persist what is ACTUALLY
+                    // bound — ASIO drivers ignore buffer changes while open.
+                    try {
+                        const running = typeof desktopApi.isAudioRunning === 'function'
+                            ? await desktopApi.isAudioRunning() : false;
+                        if (running && typeof desktopApi.getCurrentDevice === 'function') {
+                            const cur = await desktopApi.getCurrentDevice();
+                            const curInput = cur && cur.input ? String(cur.input) : '';
+                            const curType = cur && (cur.inputType || cur.type) ? String(cur.inputType || cur.type) : '';
+                            if (curInput && curInput.trim() === String(inputDevice).trim()
+                                && (!curType || curType === String(typeInfo.name))) {
+                                try { if (typeof desktopApi.setMonitorMute === 'function') await desktopApi.setMonitorMute(monitorMute); } catch (_) {}
+                                try { if (typeof desktopApi.setMonitorKill === 'function') await desktopApi.setMonitorKill(monitorKill); } catch (_) {}
+                                if (cur.output) settings.output = String(cur.output);
+                                settings.input = curInput;
+                                if (cur.sampleRate > 0) settings.sampleRate = String(cur.sampleRate);
+                                if (cur.blockSize > 0) settings.bufferSize = String(cur.blockSize);
+                                await persist();
+                                return true;
+                            }
+                        }
+                    } catch (_) { /* fall through to the full (re)bind */ }
+                    let res = null;
+                    try {
+                        res = await desktopApi.setDevice({
+                            inputType: typeInfo.name,
+                            inputDevice,
+                            outputType: typeInfo.name,
+                            outputDevice,
+                            sampleRate,
+                            bufferSize,
+                        });
+                    } catch (_) { return false; }
+                    const ok = typeof res === 'boolean' ? res : !!(res && res.ok);
+                    if (!ok) return false;
+                    try {
+                        if (Number.isFinite(inputChannel) && typeof desktopApi.setInputChannel === 'function') {
+                            await desktopApi.setInputChannel(inputChannel);
+                        }
+                    } catch (_) {}
+                    try { if (typeof desktopApi.setMonitorMute === 'function') await desktopApi.setMonitorMute(monitorMute); } catch (_) {}
+                    try { if (typeof desktopApi.setMonitorKill === 'function') await desktopApi.setMonitorKill(monitorKill); } catch (_) {}
+                    try { await desktopApi.startAudio(); } catch (_) {}
+                    await persist();
+                    return true;
+                }
+
+                // ── sound test: live input meter + audible confirmation ──────
+                let meterTimer = null;
+                const stopMeter = () => { if (meterTimer) { clearInterval(meterTimer); meterTimer = null; } };
+                function startMeter(barEl, msgEl) {
+                    stopMeter();
+                    meterTimer = setInterval(() => {
+                        (async () => {
+                            if (!barEl.isConnected) { stopMeter(); return; }
+                            let lv = null;
+                            try { lv = await desktopApi.getLevels(); } catch (_) { lv = null; }
+                            const level = lv && Number.isFinite(Number(lv.inputLevel)) ? Number(lv.inputLevel) : 0;
+                            barEl.style.width = Math.max(0, Math.min(100, Math.round(level * 100))) + '%';
+                            if (msgEl && msgEl.isConnected) {
+                                msgEl.textContent = level > 0.02
+                                    ? 'Signal detected — do you hear your guitar?'
+                                    : 'Play a note on your guitar…';
+                            }
+                        })();
+                    }, 150);
+                }
+
+                // Bounded wait for the note detector; upgrades the Calibrate
+                // button in place when it registers (boot load-order race).
+                let detectTimer = null;
+                if (!detectorReady) {
+                    const t0 = Date.now();
+                    detectTimer = setInterval(() => {
+                        if (window.noteDetect && typeof window.noteDetect.launchCalibration === 'function') {
+                            detectorReady = true;
+                            if (detectTimer) { clearInterval(detectTimer); detectTimer = null; }
+                            const b = host.querySelector('[data-is-cal]');
+                            if (b) b.textContent = 'Calibrate';
+                            const n = host.querySelector('[data-is-detector-note]');
+                            if (n) n.remove();
+                        } else if (Date.now() - t0 >= 10000) {
+                            if (detectTimer) { clearInterval(detectTimer); detectTimer = null; }
+                        }
+                    }, 100);
+                }
+                _activeCleanup = () => {
+                    if (detectTimer) { clearInterval(detectTimer); detectTimer = null; }
+                    stopMeter();
+                };
+
+                function onCalibrateClick() {
+                    if (detectorReady && window.noteDetect && typeof window.noteDetect.launchCalibration === 'function') {
                         // Hide our own full-screen overlay while note_detect's
                         // Calibration Wizard runs on top. That wizard goes
                         // transparent (pointer-events:none) when it minimizes to
@@ -187,7 +353,103 @@
                     } else {
                         advance(inst, true);
                     }
-                });
+                }
+
+                // Last source tried in the sound test, so the picker re-opens on
+                // that choice instead of falling back to the original default.
+                let lastTriedKey = null;
+
+                function renderPicker() {
+                    const fallbackKey = selected ? (selected.logicalSourceKey || selected.sourceId || '') : '';
+                    const shownKey = lastTriedKey || fallbackKey;
+                    const opts2 = sources.map((s) => {
+                        const k = s.logicalSourceKey || s.sourceId || '';
+                        return '<option value="' + esc(k) + '"' + (k && k === shownKey ? ' selected' : '') + '>' + esc(s.label || 'Input') + '</option>';
+                    }).join('');
+                    const body =
+                        '<p class="text-sm text-fb-textDim">Pick your audio input, then run the calibration to set levels, channel and latency.</p>' +
+                        (sources.length
+                            ? '<label class="block text-xs uppercase tracking-wider text-fb-textDim mt-3 mb-1">Audio input</label>' +
+                              '<select data-is-audio class="w-full bg-gray-800/50 border border-gray-700 rounded-md px-2 py-1.5 text-sm text-fb-text outline-none">' + opts2 + '</select>'
+                            : '<p class="text-sm text-fb-accent mt-2">No audio input detected yet — plug in your interface, or skip and set this up later.</p>') +
+                        (!detectorReady ? '<p data-is-detector-note class="text-xs text-fb-textDim mt-3">The note detector isn’t loaded here — you can calibrate later from the player.</p>' : '');
+                    // Desktop: the picker is a real step. Choose the interface,
+                    // then test it (binds the native engine + live meter) before
+                    // calibrating. Web (no native engine): keep the old flow,
+                    // pick + Continue straight into the calibration wizard.
+                    const testable = canDriveEngine && sources.length > 0;
+                    const foot = testable
+                        ? '<button type="button" data-is-test class="bg-fb-primary hover:bg-fb-primaryHi text-white px-5 py-2 rounded-md font-medium">Test input</button>'
+                        : '<button type="button" data-is-cal class="bg-fb-primary hover:bg-fb-primaryHi text-white px-5 py-2 rounded-md font-medium">' +
+                          (detectorReady ? 'Calibrate' : 'Continue') + '</button>';
+                    shell(inst, body, foot);
+
+                    const sel = host.querySelector('[data-is-audio]');
+                    if (sel) {
+                        // Changing the dropdown only commits the choice; the
+                        // "Test input" button binds the engine and starts the
+                        // sound test, so a wrong pick never half-applies.
+                        sel.addEventListener('change', () => { commitAudio(sel.value); });
+                        // The <select> shows its first option by default, but no `change`
+                        // fires for that implicit pick — so on a first run with nothing yet
+                        // selected, audio-input would calibrate against the wrong/no source.
+                        // Commit the shown option up-front so the displayed device is the
+                        // one calibrated (idempotent if it was already selected).
+                        if (!selected && !lastTriedKey) commitAudio(sel.value);
+                    }
+                    const testBtn = host.querySelector('[data-is-test]');
+                    if (testBtn) {
+                        testBtn.addEventListener('click', () => {
+                            const key = sel ? sel.value : '';
+                            if (!key) return;
+                            commitAudio(key);
+                            enterTest(key).catch(() => {});
+                        });
+                    } else {
+                        host.querySelector('[data-is-cal]').addEventListener('click', onCalibrateClick);
+                    }
+                }
+
+                async function enterTest(key) {
+                    if (!key) { renderPicker(); return; }
+                    lastTriedKey = key;
+                    stopMeter();
+                    commitAudio(key);
+                    const body =
+                        '<p class="text-sm text-fb-textDim">Testing input: <span class="text-fb-text font-medium">' + esc(sourceLabel(key)) + '</span></p>' +
+                        '<p data-is-test-msg class="text-sm text-fb-textDim mt-3">Configuring the audio engine…</p>' +
+                        '<div class="mt-2 h-2 rounded bg-gray-800/70 overflow-hidden"><div data-is-meter-bar class="h-full bg-fb-primary" style="width:0%"></div></div>' +
+                        '<div class="mt-4"><button type="button" data-is-nosound class="text-sm text-fb-textDim hover:text-fb-text">No sound — pick another input</button></div>';
+                    const foot =
+                        '<button type="button" data-is-hear class="bg-fb-primary hover:bg-fb-primaryHi text-white px-5 py-2 rounded-md font-medium">I hear it</button>';
+                    shell(inst, body, foot);
+                    const msgEl = host.querySelector('[data-is-test-msg]');
+                    const barEl = host.querySelector('[data-is-meter-bar]');
+                    host.querySelector('[data-is-nosound]').addEventListener('click', () => { stopMeter(); renderPicker(); });
+                    host.querySelector('[data-is-hear]').addEventListener('click', () => { stopMeter(); renderReady(key); });
+                    const applied = await applySourceToEngine(key);
+                    if (!host.contains(msgEl)) return; // user moved on while applying
+                    if (!applied) {
+                        msgEl.innerHTML = '<span class="text-fb-accent">Couldn’t open this device — make sure it isn’t in use by another app.</span> Check the meter, then answer below.';
+                    } else {
+                        msgEl.textContent = 'Play a note on your guitar…';
+                    }
+                    if (barEl.isConnected) startMeter(barEl, applied ? msgEl : null);
+                }
+
+                function renderReady(key) {
+                    const body =
+                        '<p class="text-sm text-fb-textDim"><span class="text-fb-primary font-semibold">Input configured and working</span> — ' + esc(sourceLabel(key)) + ' is set as your audio input.</p>' +
+                        '<p class="text-sm text-fb-textDim mt-2">Next, run the calibration: it tunes your guitar, measures the noise floor and sets levels, channel and latency.</p>' +
+                        (!detectorReady ? '<p data-is-detector-note class="text-xs text-fb-textDim mt-3">The note detector isn’t loaded here — you can calibrate later from the player.</p>' : '');
+                    const foot =
+                        '<button type="button" data-is-cal class="bg-fb-primary hover:bg-fb-primaryHi text-white px-5 py-2 rounded-md font-medium">' +
+                        (detectorReady ? 'Calibrate' : 'Continue') + '</button>';
+                    shell(inst, body, foot);
+                    host.querySelector('[data-is-cal]').addEventListener('click', onCalibrateClick);
+                }
+
+                renderPicker();
             }
 
             // Keys/drums: pick a MIDI device via midi-input and confirm a live hit.
