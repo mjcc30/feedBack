@@ -744,6 +744,39 @@
             // Step 6 — "Play it now": leave calibration pending (it completes
             // through the normal scored-stats path) and launch the diagnostic.
             const target = diagnosticFilename;
+            // The diagnostic song needs a RUNNING, AUDIBLE engine. The
+            // wizard's input_setup step configured and persisted the device;
+            // make sure the engine is up and the monitoring prefs (and the
+            // amp-sim tone chain, when opted in) match before the song
+            // starts — otherwise the challenge launches into silence.
+            if (isDesktop && window.feedBackDesktop && window.feedBackDesktop.audio) {
+                try {
+                    const audio = window.feedBackDesktop.audio;
+                    const running = typeof audio.isAudioRunning === 'function'
+                        ? await audio.isAudioRunning() : false;
+                    if (!running && typeof audio.startAudio === 'function') await audio.startAudio();
+                    if (typeof audio.loadDeviceSettings === 'function') {
+                        const saved = await audio.loadDeviceSettings();
+                        if (saved) {
+                            if (typeof saved.monitorMute === 'boolean' && typeof audio.setMonitorMute === 'function') {
+                                await audio.setMonitorMute(saved.monitorMute);
+                            }
+                            if (typeof saved.monitorKill === 'boolean' && typeof audio.setMonitorKill === 'function') {
+                                await audio.setMonitorKill(saved.monitorKill);
+                            }
+                        } else if (typeof audio.setMonitorMute === 'function') {
+                            // Fresh profile: the native engine boots with direct
+                            // monitoring muted — unmute so the challenge is audible.
+                            await audio.setMonitorMute(false);
+                        }
+                    }
+                } catch (e) { /* best-effort */ }
+                try {
+                    if (typeof window._aeEnsureAmpSimsMonitoring === 'function') {
+                        await window._aeEnsureAmpSimsMonitoring();
+                    }
+                } catch (e) { /* best-effort */ }
+            }
             await finish({ launchingSong: !!target });
             if (target && typeof window.playSong === 'function') window.playSong(target);
         });
