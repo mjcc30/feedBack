@@ -88,6 +88,30 @@
             : String(values.includes(48000) ? 48000 : values[0]);
     }
 
+    // Fill a <select> with the device's supported buffer sizes (unique,
+    // ascending). Mirrors _renderRateOptions: keeps the current selection
+    // when still offered, else `preferred`, else 256 when available, else
+    // the lowest size. The pick is the user's choice — persisted and
+    // applied as picked, no floor, no clamp.
+    function _renderBufferOptions(sel, bufs, preferred) {
+        if (!sel) return;
+        const previous = sel.value;
+        const values = Array.from(new Set((Array.isArray(bufs) ? bufs : [])
+            .map(Number).filter(Number.isFinite))).sort((a, b) => a - b);
+        if (!values.length) values.push(256);
+        sel.innerHTML = '';
+        values.forEach((b) => {
+            const opt = document.createElement('option');
+            opt.value = String(b);
+            opt.textContent = b + ' samples';
+            sel.appendChild(opt);
+        });
+        const pref = Number(preferred);
+        sel.value = (previous !== '' && values.includes(Number(previous))) ? previous
+            : (Number.isFinite(pref) && values.includes(pref)) ? String(pref)
+            : String(values.includes(256) ? 256 : values[0]);
+    }
+
     // Fill a <select> with the device's input channels, mirroring the
     // audio_engine panel's semantics: -1 = "Default pair (Mono Mix)" (or
     // "Default input" for a single channel), then 0-based channels named
@@ -260,29 +284,32 @@
                 }
                 // ── desktop: bind the picked source to the native engine ─────
                 // Mirrors the audio_engine panel's Apply: probe the supported
-                // rates/buffers, open at 48 kHz / 256 samples (reusing the
-                // persisted rate/buffer/channel when the saved config describes
-                // the same input), make monitoring audible unless a saved pref
-                // says otherwise, start the engine, and PERSIST so the Audio
-                // screen and every later open converge on this config. `opts`
-                // carries the wizard's fine-tune picks (sampleRate /
-                // inputChannel) and wins over the saved config for this run.
+                // rates/buffers, open at 48 kHz / the picked buffer size
+                // (reusing the persisted rate/buffer/channel when the saved
+                // config describes the same input), make monitoring audible
+                // unless a saved pref says otherwise, start the engine, and
+                // PERSIST so the Audio screen and every later open converge on
+                // this config. `opts` carries the wizard's fine-tune picks
+                // (sampleRate / bufferSize / inputChannel) and wins over the
+                // saved config for this run.
                 async function applySourceToEngine(key, opts) {
                     opts = opts || {};
                     const resolved = await _resolveSourceForKey(key);
                     if (!resolved) return false;
                     const { typeInfo, inputDevice, outputDevice, rates, bufs, saved, savedMatches } = resolved;
                     let sampleRate = rates.includes(48000) ? 48000 : rates[0];
-                    // Default buffer 256: tiny ASIO buffers (16 samples) clip
-                    // badly with the in-app monitoring chain. A persisted
-                    // buffer below 64 samples is ignored — it was bound by an
-                    // older build that opened at the driver minimum.
-                    let bufferSize = bufs.includes(256) ? 256
-                        : (bufs.find((b) => b >= 256) || Math.max.apply(null, bufs));
+                    // The buffer size is the user's explicit choice (wizard
+                    // fine-tune select, Audio panel, or a persisted value) —
+                    // applied and persisted as picked, no floor, no clamp.
+                    // The default only kicks in when nothing valid is known.
+                    let bufferSize = bufs.includes(256) ? 256 : bufs[0];
                     if (savedMatches) {
                         if (rates.includes(Number(saved.sampleRate))) sampleRate = Number(saved.sampleRate);
                         const savedBuf = Number(saved.bufferSize);
-                        if (Number.isFinite(savedBuf) && savedBuf >= 64 && bufs.includes(savedBuf)) bufferSize = savedBuf;
+                        if (Number.isFinite(savedBuf) && bufs.includes(savedBuf)) bufferSize = savedBuf;
+                    }
+                    if (Number.isFinite(Number(opts.bufferSize)) && bufs.includes(Number(opts.bufferSize))) {
+                        bufferSize = Number(opts.bufferSize);
                     }
                     if (Number.isFinite(Number(opts.sampleRate)) && rates.includes(Number(opts.sampleRate))) {
                         sampleRate = Number(opts.sampleRate);
@@ -317,9 +344,7 @@
                     // If the engine already runs with exactly this device, don't
                     // tear it down (a redundant setDevice stops/starts the stream);
                     // converge the monitoring prefs and persist what is ACTUALLY
-                    // bound — ASIO drivers ignore buffer changes while open. A
-                    // running engine on a sub-64 buffer (the old 16-sample bind)
-                    // does NOT take this path: it must be rebound at 256+.
+                    // bound — ASIO drivers ignore buffer changes while open.
                     try {
                         const running = typeof desktopApi.isAudioRunning === 'function'
                             ? await desktopApi.isAudioRunning() : false;
@@ -328,8 +353,7 @@
                             const curInput = cur && cur.input ? String(cur.input) : '';
                             const curType = cur && (cur.inputType || cur.type) ? String(cur.inputType || cur.type) : '';
                             if (curInput && curInput.trim() === String(inputDevice).trim()
-                                && (!curType || curType === String(typeInfo.name))
-                                && !(cur.blockSize > 0 && cur.blockSize < 64)) {
+                                && (!curType || curType === String(typeInfo.name))) {
                                 try { if (typeof desktopApi.setMonitorMute === 'function') await desktopApi.setMonitorMute(monitorMute); } catch (_) {}
                                 try { if (typeof desktopApi.setMonitorKill === 'function') await desktopApi.setMonitorKill(monitorKill); } catch (_) {}
                                 if (cur.output) settings.output = String(cur.output);
@@ -445,24 +469,31 @@
                 // probe must not fill the selects of a panel the user already
                 // left (or a newer device pick).
                 let fineTuneGen = 0;
-                // Populate the sample-rate / input-channel selects for the
-                // picked device. Keeps the current selection when still
-                // offered; otherwise the saved value when it describes this
-                // same device; otherwise 48000 Hz / the default channel.
+                // Populate the sample-rate / buffer-size / input-channel
+                // selects for the picked device. Keeps the current selection
+                // when still offered; otherwise the saved value when it
+                // describes this same device; otherwise 48000 Hz / 256
+                // samples / the default channel.
                 async function refreshFineTune(key) {
                     const gen = ++fineTuneGen;
                     const rateSel = host.querySelector('[data-is-rate]');
+                    const bufSel = host.querySelector('[data-is-buffer]');
                     const chSel = host.querySelector('[data-is-channel]');
-                    if (!rateSel || !chSel || !key) return;
+                    if (!rateSel || !bufSel || !chSel || !key) return;
                     const resolved = await _resolveSourceForKey(key);
-                    if (gen !== fineTuneGen || !host.contains(rateSel) || !host.contains(chSel)) return;
+                    if (gen !== fineTuneGen || !host.contains(rateSel) || !host.contains(bufSel) || !host.contains(chSel)) return;
                     if (!resolved) return;
-                    const { probe, rates, saved, savedMatches } = resolved;
+                    const { probe, rates, bufs, saved, savedMatches } = resolved;
                     let preferredRate = rates.includes(48000) ? 48000 : rates[0];
                     if (savedMatches && rates.includes(Number(saved.sampleRate))) {
                         preferredRate = Number(saved.sampleRate);
                     }
                     _renderRateOptions(rateSel, rates, preferredRate);
+                    let preferredBuffer = bufs.includes(256) ? 256 : bufs[0];
+                    if (savedMatches && bufs.includes(Number(saved.bufferSize))) {
+                        preferredBuffer = Number(saved.bufferSize);
+                    }
+                    _renderBufferOptions(bufSel, bufs, preferredBuffer);
                     const names = (probe && Array.isArray(probe.inputChannels)) ? probe.inputChannels : [];
                     let preferredChannel = -1;
                     if (savedMatches && Number.isFinite(Number(saved.inputChannel))) {
@@ -483,12 +514,16 @@
                     // calibrating. Web (no native engine): keep the old flow,
                     // pick + Continue straight into the calibration wizard.
                     const testable = canDriveEngine && sources.length > 0;
-                    // Fine-tune controls (sample rate + input channel) only
-                    // make sense when we can drive the native engine.
+                    // Fine-tune controls (sample rate + buffer size + input
+                    // channel) only make sense when we can drive the native
+                    // engine. The buffer size is the user's pick, persisted
+                    // as chosen — no floor, no clamp.
                     const fineTuneHtml = testable
-                        ? '<div class="grid grid-cols-2 gap-2 mt-2">' +
+                        ? '<div class="grid grid-cols-3 gap-2 mt-2">' +
                           '<div><label class="block text-xs uppercase tracking-wider text-fb-textDim mb-1">Sample rate</label>' +
                           '<select data-is-rate class="w-full bg-gray-800/50 border border-gray-700 rounded-md px-2 py-1.5 text-sm text-fb-text outline-none"></select></div>' +
+                          '<div><label class="block text-xs uppercase tracking-wider text-fb-textDim mb-1">Buffer size</label>' +
+                          '<select data-is-buffer class="w-full bg-gray-800/50 border border-gray-700 rounded-md px-2 py-1.5 text-sm text-fb-text outline-none"></select></div>' +
                           '<div><label class="block text-xs uppercase tracking-wider text-fb-textDim mb-1">Input channel</label>' +
                           '<select data-is-channel class="w-full bg-gray-800/50 border border-gray-700 rounded-md px-2 py-1.5 text-sm text-fb-text outline-none"></select></div>' +
                           '</div>'
@@ -532,9 +567,11 @@
                             if (!key) return;
                             commitAudio(key);
                             const rateSel = host.querySelector('[data-is-rate]');
+                            const bufSel = host.querySelector('[data-is-buffer]');
                             const chSel = host.querySelector('[data-is-channel]');
                             enterTest(key, {
                                 sampleRate: rateSel && rateSel.value !== '' ? Number(rateSel.value) : NaN,
+                                bufferSize: bufSel && bufSel.value !== '' ? Number(bufSel.value) : NaN,
                                 inputChannel: chSel && chSel.value !== '' ? Number(chSel.value) : NaN,
                             }).catch(() => {});
                         });
