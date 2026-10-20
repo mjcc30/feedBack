@@ -315,6 +315,40 @@
         });
     }
 
+    // Wait (bounded) for the plugins the calibration challenge needs loaded
+    // and active: the note detector (in-play HUD + scoring) and the rig
+    // builder (amp-rig / tone flow). Plugins register their routes on a
+    // background thread at startup, so onboarding can reach the challenge
+    // before they are ready; launching early leaves the challenge without
+    // note detection or the rig builder. /api/plugins reports each plugin's
+    // status ("ready" only once its routes are registered) and its enabled
+    // flag; both must hold for every required plugin. A timeout still lets the
+    // challenge start — better a degraded challenge than a stuck onboarding.
+    function waitForChallengePlugins(timeoutMs) {
+        const REQUIRED = ['note_detect', 'rig_builder'];
+        const ready = async () => {
+            try {
+                const r = await fetch('/api/plugins');
+                if (!r.ok) return false;
+                const list = await r.json();
+                return REQUIRED.every((id) => {
+                    const p = (Array.isArray(list) ? list : []).find((x) => x && x.id === id);
+                    return !!p && p.status === 'ready' && p.enabled !== false;
+                });
+            } catch (e) { return false; }
+        };
+        return new Promise((resolve) => {
+            let settled = false;
+            const finish = (v) => { if (!settled) { settled = true; clearInterval(iv); resolve(v); } };
+            ready().then((ok) => { if (ok) finish(true); });
+            const t0 = Date.now();
+            const iv = setInterval(async () => {
+                if (await ready()) finish(true);
+                else if (Date.now() - t0 >= timeoutMs) finish(false);
+            }, 250);
+        });
+    }
+
     async function runInputSetup(paths) {
         const instruments = (Array.isArray(paths) ? paths : []).map((p) => String(p).toLowerCase());
         if (!instruments.length) return;
@@ -831,10 +865,22 @@
                     }
                 } catch (e) { /* best-effort */ }
             }
+            // The challenge needs its plugins loaded and active before the
+            // song starts (plugins register their routes on a background
+            // thread at startup). Wait (bounded) and tell the user what is
+            // happening — launching early leaves the challenge without note
+            // detection or the rig builder.
+            submit.disabled = true;
+            submit.textContent = 'Loading plugins…';
+            try {
+                await waitForChallengePlugins(20000);
+            } finally {
+                submit.textContent = 'Play it now';
+            }
             await finish({ launchingSong: !!target });
             // The note detector installs its playSong wrapper at the very end
             // of its deferred screen.js — launching before it is ready leaves
-            // detection OFF and the challenge hears nothing on its first run.
+            // note detection OFF and the challenge hears nothing on its first run.
             await waitForNoteDetector(10000);
             if (target && typeof window.playSong === 'function') window.playSong(target);
         });
