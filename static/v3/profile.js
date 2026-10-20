@@ -270,10 +270,11 @@
     // calibrated input. Capability-idiomatic: dispatch `run` (fire-and-launch)
     // and await the `calibration-done` event. Degrades gracefully when the
     // plugin/runtime is absent so onboarding can never be stranded.
-    // Step 6 (audio paths only) then runs the note detector's Calibration
-    // Wizard — tuner, noise floor, signal level, note detection, timing —
-    // before the calibration challenge, so the diagnostic's scores rest on a
-    // measured input.
+    // The input-setup panel's "Calibrate" button runs the note detector's
+    // Calibration Wizard (noise floor, signal level, note detection, timing)
+    // exactly once, right before the calibration challenge — so the
+    // diagnostic's scores rest on a measured input, and the wizard never
+    // relaunches a second time ahead of the challenge.
     // Wait (bounded) for the bundled input_setup plugin to finish registering
     // its input-calibration owner. Plugins load asynchronously, so onboarding
     // can reach this step before the plugin is ready — without this wait the
@@ -314,53 +315,6 @@
         });
     }
 
-    // ── Calibration step helper (step 6, between input setup and the challenge) ──
-    // Step 6 launches the note detector's Calibration Wizard — the full
-    // measurement flow (tuner, noise floor, signal level, note detection,
-    // timing) the challenge's scores depend on. The plugin's screen.js is
-    // huge and deferred and exports window.noteDetect (with
-    // launchCalibration) only at its very end, so wait (bounded) for that
-    // entry point instead of failing on a boot load-order race. The wizard
-    // is its own full-screen overlay and goes transparent (pointer-events:
-    // none) when it minimizes to expose the Tuner, so hide this onboarding
-    // modal while it runs — otherwise it shows through behind the tuner.
-    // Restore on done (which advances to the challenge) or cancel (which
-    // stays on this step so the user can retry or skip). The plugin fires
-    // exactly one of the callbacks, one-shot, when the wizard closes.
-    function waitForCalibrationLauncher(timeoutMs) {
-        const ready = () => !!(window.noteDetect
-            && typeof window.noteDetect.launchCalibration === 'function');
-        return new Promise((resolve) => {
-            if (ready()) { resolve(true); return; }
-            const t0 = Date.now();
-            const iv = setInterval(() => {
-                if (ready()) { clearInterval(iv); resolve(true); }
-                else if (Date.now() - t0 >= timeoutMs) { clearInterval(iv); resolve(false); }
-            }, 100);
-        });
-    }
-    async function runCalibrationWizard(instrument, onApplied, onDismissed) {
-        if (!(await waitForCalibrationLauncher(10000))) return false;
-        const ob = document.getElementById('v3-onboarding');
-        const obPrevDisplay = ob ? ob.style.display : '';
-        if (ob) ob.style.display = 'none';
-        const restoreOnboarding = () => {
-            const o = document.getElementById('v3-onboarding');
-            if (o) o.style.display = obPrevDisplay;
-        };
-        try {
-            window.noteDetect.launchCalibration({
-                instrument: instrument,
-                onDone: () => { restoreOnboarding(); if (typeof onApplied === 'function') onApplied(); },
-                onCancel: () => { restoreOnboarding(); if (typeof onDismissed === 'function') onDismissed(); },
-            });
-        } catch (_) {
-            restoreOnboarding();
-            return false;
-        }
-        return true;
-    }
-
     async function runInputSetup(paths) {
         const instruments = (Array.isArray(paths) ? paths : []).map((p) => String(p).toLowerCase());
         if (!instruments.length) return;
@@ -368,9 +322,9 @@
         if (!(await waitForInputSetup(8000))) return;
         // Hide this onboarding modal while the input-setup wizard (its own
         // full-screen overlay) runs on top. Otherwise both stay stacked, and when
-        // the note-detect calibration wizard minimizes to expose the Tuner the
-        // onboarding modal shows through behind the tuner. Restored in `finally`
-        // before we advance to the calibration-challenge step.
+        // the note-detect calibration wizard minimizes to expose the song
+        // highway (play-along) the onboarding modal shows through behind it.
+        // Restored in `finally` before we advance to the calibration-challenge step.
         const ob = document.getElementById('v3-onboarding');
         const obPrevDisplay = ob ? ob.style.display : '';
         if (ob) ob.style.display = 'none';
@@ -411,11 +365,10 @@
         // is skipped there. See feedBack-desktop#46.
         const isDesktop = !!window.feedBackDesktop;
         // The steps this run actually visits. 1–4 always run; 5 (amp sims) is
-        // desktop-only; 6 (calibration wizard) only when an audio path
-        // (guitar/bass) was picked — MIDI-only players have nothing to
-        // calibrate; 7 is the calibration challenge. Rebuilt by the step-4
-        // handler once the path picks are known; renderDots() draws the
-        // strip from it.
+        // desktop-only; 7 is the calibration challenge. There is no separate
+        // calibration-wizard step: the input-setup step's "Calibrate" button
+        // already runs the wizard once, ahead of the challenge. Rebuilt by
+        // the step-4 handler; renderDots() draws the strip from it.
         let stepSeq = [1, 2, 3, 4];
 
         const stepDots = editing ? '' :
@@ -478,15 +431,6 @@
             '<span class="block text-xs text-fb-textDim mt-1">Loads your saved tone chain for monitoring. You can change this any time in the desktop Audio settings.</span></span>' +
             '</label>' +
             '<p class="text-xs text-fb-textDim mt-2">Leave it unticked if you monitor through your own gear. This is off by default.</p></div>' +
-            // Step 6 — calibrate your setup (only visited when an audio path
-            // was picked; stepSeq is rebuilt in the step-4 handler). "Calibrate
-            // now" launches the note detector's Calibration Wizard (tuner,
-            // noise floor, signal level, note detection, timing) on top of
-            // this overlay; applying it advances to the challenge.
-            '<div id="v3-ob-step6" class="hidden">' +
-            '<label class="block text-xs uppercase tracking-wider text-fb-textDim mb-2">Calibrate your setup</label>' +
-            '<p class="text-sm text-fb-textDim">Tune your guitar and let the wizard measure your <span class="text-fb-text">noise floor</span>, <span class="text-fb-text">signal level</span> and <span class="text-fb-text">note detection</span> — a calibrated input makes the calibration challenge (and every later score) far more accurate.</p>' +
-            '<p class="text-sm text-fb-textDim mt-2">Press <span class="text-fb-text font-medium">Calibrate now</span> to open the calibration wizard. Not ready? Skip it and calibrate later.</p></div>' +
             // Step 7 — calibration offer (first-run only).
             '<div id="v3-ob-step7" class="hidden">' +
             '<label class="block text-xs uppercase tracking-wider text-fb-textDim mb-2">Calibration challenge</label>' +
@@ -565,7 +509,8 @@
             step = n;
             errEl.classList.add('hidden');
             for (let i = 1; i <= 7; i++) {
-                overlay.querySelector('#v3-ob-step' + i).classList.toggle('hidden', i !== n);
+                const stepEl = overlay.querySelector('#v3-ob-step' + i);
+                if (stepEl) stepEl.classList.toggle('hidden', i !== n);
             }
             overlay.querySelectorAll('#v3-ob-dots [data-dot]').forEach((d) => {
                 d.classList.toggle('bg-fb-primary', Number(d.getAttribute('data-dot')) <= n);
@@ -578,14 +523,12 @@
                     : n === 3 ? 'Feats of Power (optional)'
                     : n === 4 ? 'Choose your instrument paths'
                     : n === 5 ? 'How do you want to monitor?'
-                    : n === 6 ? 'Calibrate your setup'
                     : 'One last thing — the calibration challenge';
             }
-            submit.textContent = n === 6 ? 'Calibrate now' : n === 7 ? 'Play it now' : 'Next';
-            // Skip is offered on the song-directory step (configure later), the
-            // calibration step (calibrate later) and the calibration
-            // challenge (the last step).
-            skipBtn.classList.toggle('hidden', !(n === 2 || n === 6 || n === 7));
+            submit.textContent = n === 7 ? 'Play it now' : 'Next';
+            // Skip is offered on the song-directory step (configure later) and
+            // the calibration challenge (the last step).
+            skipBtn.classList.toggle('hidden', !(n === 2 || n === 7));
             refreshSubmit();
         }
 
@@ -821,13 +764,13 @@
                     // New step: input-device selection + calibration, between
                     // path selection and the note-detect calibration challenge.
                     await runInputSetup(selectedPaths);
-                    // Rebuild the remaining steps now that the path picks are
-                    // known: amp sims (desktop only), then the calibration
-                    // wizard when an audio path (guitar/bass) was picked, then
-                    // the challenge.
+                    // Rebuild the remaining steps: amp sims (desktop only),
+                    // then the challenge. The calibration wizard already ran
+                    // inside the input-setup step above (its "Calibrate"
+                    // button) — no second wizard step, so it never relaunches
+                    // ahead of the challenge.
                     stepSeq = [1, 2, 3, 4];
                     if (isDesktop) stepSeq.push(5);
-                    if (selectedPaths.some((p) => p === 'guitar' || p === 'bass')) stepSeq.push(6);
                     stepSeq.push(7);
                     renderDots();
                     setStep(nextStepAfter(4));
@@ -850,22 +793,6 @@
                     } catch (e) { /* best-effort — settable later */ }
                     setStep(nextStepAfter(5));
                 } finally { refreshSubmit(); }
-                return;
-            }
-            if (step === 6) {
-                // Calibration step — run the note detector's Calibration
-                // Wizard (tuner, noise floor, signal level, note detection,
-                // timing) on top of this overlay. Applying it advances to
-                // the challenge; cancelling stays here (retry or skip).
-                submit.disabled = true;
-                const instrument = selectedPaths.indexOf('guitar') >= 0 ? 'guitar' : 'bass';
-                const launched = await runCalibrationWizard(instrument,
-                    () => setStep(nextStepAfter(6)),
-                    () => refreshSubmit());
-                if (!launched) {
-                    showErr('The calibration wizard couldn’t start — try again, or skip for now.');
-                    refreshSubmit();
-                }
                 return;
             }
             // Step 7 — "Play it now": leave calibration pending (it completes
@@ -919,13 +846,7 @@
                 setStep(3);
                 return;
             }
-            // Calibration step — skip: calibrate later (from the player's
-            // input setup), advance to the challenge.
-            if (step === 6) {
-                setStep(nextStepAfter(6));
-                return;
-            }
-            // Calibration step (last) — skip: Mastery Rank 1 immediately,
+            // Calibration challenge (last step) — skip: Mastery Rank 1 immediately,
             // calibration stays replayable from the Progress screen.
             skipBtn.disabled = true;
             try {

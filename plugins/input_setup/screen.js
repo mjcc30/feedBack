@@ -208,8 +208,8 @@
             // Guitar/bass: pick the audio source (audio-input), APPLY it to the
             // native engine on desktop (device + rate + buffer + monitoring prefs,
             // persisted), confirm the guitar is audible (live meter), then launch
-            // the note_detect Calibration Wizard for the deep work (tuner / noise
-            // floor / low-E & open-A / timing).
+            // the note_detect Calibration Wizard for the deep work (noise
+            // floor / signal level / open-string detection / timing).
             async function renderAudioPanel(inst) {
                 const { sources, selected } = await _audioSources();
                 const desktopApi = (window.feedBackDesktop && window.feedBackDesktop.audio) || null;
@@ -439,11 +439,12 @@
                         // Hide our own full-screen overlay while note_detect's
                         // Calibration Wizard runs on top. That wizard goes
                         // transparent (pointer-events:none) when it minimizes to
-                        // expose the Tuner; if our overlay stayed up it would show
-                        // through — covering the tuner with the still-mounted
-                        // "select your input" card and looking like a second
-                        // wizard at the input step. Restore it on done/cancel
-                        // (one of which always fires when that wizard closes).
+                        // expose the song highway (play-along); if our overlay
+                        // stayed up it would show through — covering the highway
+                        // with the still-mounted "select your input" card and
+                        // looking like a second wizard at the input step. Restore
+                        // it on done/cancel (one of which always fires when that
+                        // wizard closes).
                         const ov = document.getElementById('input-setup-overlay');
                         const prevDisplay = ov ? ov.style.display : '';
                         if (ov) ov.style.display = 'none';
