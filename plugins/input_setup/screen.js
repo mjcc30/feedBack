@@ -66,6 +66,61 @@
         } catch (_) { return { sources: [], selected: null }; }
     }
 
+    // Fill a <select> with the device's supported sample rates (unique,
+    // ascending). Keeps the current selection when still offered, else
+    // `preferred`, else 48000 when available, else the lowest rate.
+    function _renderRateOptions(sel, rates, preferred) {
+        if (!sel) return;
+        const previous = sel.value;
+        const values = Array.from(new Set((Array.isArray(rates) ? rates : [])
+            .map(Number).filter(Number.isFinite))).sort((a, b) => a - b);
+        if (!values.length) values.push(48000);
+        sel.innerHTML = '';
+        values.forEach((r) => {
+            const opt = document.createElement('option');
+            opt.value = String(r);
+            opt.textContent = r + ' Hz';
+            sel.appendChild(opt);
+        });
+        const pref = Number(preferred);
+        sel.value = (previous !== '' && values.includes(Number(previous))) ? previous
+            : (Number.isFinite(pref) && values.includes(pref)) ? String(pref)
+            : String(values.includes(48000) ? 48000 : values[0]);
+    }
+
+    // Fill a <select> with the device's input channels, mirroring the
+    // audio_engine panel's semantics: -1 = "Default pair (Mono Mix)" (or
+    // "Default input" for a single channel), then 0-based channels named
+    // `<name> (Input N, Ch N)`. Keeps the current selection when still
+    // valid, else `preferred`, else -1.
+    function _renderChannelOptions(sel, names, preferred) {
+        if (!sel) return;
+        const previous = sel.value;
+        const list = Array.isArray(names) ? names.map(String) : [];
+        const count = list.length > 0 ? list.length : 2;
+        const choices = [{ value: '-1', label: count > 1 ? 'Default pair (Mono Mix)' : 'Default input' }];
+        for (let i = 0; i < count; i++) {
+            const name = (list[i] || '').trim();
+            const ch = i + 1;
+            choices.push({
+                value: String(i),
+                label: name ? name + ' (Input ' + ch + ', Ch ' + ch + ')' : 'Input ' + ch + ' (Ch ' + ch + ')',
+            });
+        }
+        sel.innerHTML = '';
+        choices.forEach((c) => {
+            const opt = document.createElement('option');
+            opt.value = c.value;
+            opt.textContent = c.label;
+            sel.appendChild(opt);
+        });
+        // NB: Number('') === 0, so an empty previous value must be rejected
+        // explicitly or it would count as the valid channel 0.
+        const isValid = (v) => v === '-1'
+            || (v !== '' && Number.isInteger(Number(v)) && Number(v) >= 0 && Number(v) < count);
+        sel.value = isValid(previous) ? previous : (isValid(preferred) ? String(preferred) : '-1');
+    }
+
     // ── Wizard UI ────────────────────────────────────────────────────────────
     // Renders sequential per-instrument panels into `host`. Resolves the
     // returned promise to { completed:[...], skipped:[...] } when finished.
@@ -153,26 +208,24 @@
                 // Tell the tuner tables / note_detect which instrument this is.
                 try { fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ instrument: inst }) }); } catch (_) {}
 
-                // ── desktop: bind the picked source to the native engine ─────
-                // Mirrors the audio_engine panel's Apply: resolve the driver type
-                // and device from the logical source key, probe the supported
-                // rates/buffers, open at 48 kHz / smallest supported buffer
-                // (reusing the persisted rate/buffer when the saved config
-                // describes the same input), make monitoring audible unless a
-                // saved pref says otherwise, start the engine, and PERSIST so the
-                // Audio screen and every later open converge on this config.
                 const normKeyPart = (s) => String(s || 'default')
                     .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'default';
-                async function applySourceToEngine(key) {
-                    if (!canDriveEngine || !key) return false;
+                // Resolve a logical source key to the concrete driver type and
+                // input/output device names, probe what that device supports
+                // (sample rates, buffer sizes, input channels), and load the
+                // persisted settings (flagging whether they describe THIS
+                // input). Shared by the engine bind (applySourceToEngine) and
+                // the fine-tune selects (refreshFineTune).
+                async function _resolveSourceForKey(key) {
+                    if (!canDriveEngine || !key) return null;
                     const nameMatch = /^desktop-audio:([^:]+):input:name:(.+)$/.exec(key);
                     const indexMatch = nameMatch ? null : /^desktop-audio:([^:]+):input:(\d+)$/.exec(key);
-                    if (!nameMatch && !indexMatch) return false;
+                    if (!nameMatch && !indexMatch) return null;
                     const typeKey = nameMatch ? nameMatch[1] : indexMatch[1];
                     let types = [];
-                    try { types = (await desktopApi.getDeviceTypes()) || []; } catch (_) { return false; }
+                    try { types = (await desktopApi.getDeviceTypes()) || []; } catch (_) { return null; }
                     const typeInfo = types.find((t) => t && normKeyPart(t.name) === typeKey) || null;
-                    if (!typeInfo || !typeInfo.name) return false;
+                    if (!typeInfo || !typeInfo.name) return null;
                     const inputs = Array.isArray(typeInfo.inputs) ? typeInfo.inputs : [];
                     let inputDevice = '';
                     if (nameMatch) {
@@ -183,7 +236,7 @@
                         const i = Number(indexMatch[2]);
                         inputDevice = (i >= 0 && i < inputs.length) ? inputs[i] : '';
                     }
-                    if (!inputDevice) return false;
+                    if (!inputDevice) return null;
                     // Duplex on the same physical device when the driver type
                     // exposes an output under the same name.
                     const outputs = Array.isArray(typeInfo.outputs) ? typeInfo.outputs : [];
@@ -203,14 +256,40 @@
                         && typeof saved.input === 'string'
                         && saved.input.trim() === String(inputDevice).trim()
                         && String(saved.inputType || saved.type || '') === String(typeInfo.name));
+                    return { typeInfo, inputDevice, outputDevice, probe, rates, bufs, saved, savedMatches };
+                }
+                // ── desktop: bind the picked source to the native engine ─────
+                // Mirrors the audio_engine panel's Apply: probe the supported
+                // rates/buffers, open at 48 kHz / 256 samples (reusing the
+                // persisted rate/buffer/channel when the saved config describes
+                // the same input), make monitoring audible unless a saved pref
+                // says otherwise, start the engine, and PERSIST so the Audio
+                // screen and every later open converge on this config. `opts`
+                // carries the wizard's fine-tune picks (sampleRate /
+                // inputChannel) and wins over the saved config for this run.
+                async function applySourceToEngine(key, opts) {
+                    opts = opts || {};
+                    const resolved = await _resolveSourceForKey(key);
+                    if (!resolved) return false;
+                    const { typeInfo, inputDevice, outputDevice, rates, bufs, saved, savedMatches } = resolved;
                     let sampleRate = rates.includes(48000) ? 48000 : rates[0];
-                    let bufferSize = Math.min.apply(null, bufs);
+                    // Default buffer 256: tiny ASIO buffers (16 samples) clip
+                    // badly with the in-app monitoring chain. A persisted
+                    // buffer below 64 samples is ignored — it was bound by an
+                    // older build that opened at the driver minimum.
+                    let bufferSize = bufs.includes(256) ? 256
+                        : (bufs.find((b) => b >= 256) || Math.max.apply(null, bufs));
                     if (savedMatches) {
                         if (rates.includes(Number(saved.sampleRate))) sampleRate = Number(saved.sampleRate);
-                        if (bufs.includes(Number(saved.bufferSize))) bufferSize = Number(saved.bufferSize);
+                        const savedBuf = Number(saved.bufferSize);
+                        if (Number.isFinite(savedBuf) && savedBuf >= 64 && bufs.includes(savedBuf)) bufferSize = savedBuf;
                     }
-                    const inputChannel = savedMatches && Number.isFinite(Number(saved.inputChannel))
+                    if (Number.isFinite(Number(opts.sampleRate)) && rates.includes(Number(opts.sampleRate))) {
+                        sampleRate = Number(opts.sampleRate);
+                    }
+                    let inputChannel = savedMatches && Number.isFinite(Number(saved.inputChannel))
                         ? Number(saved.inputChannel) : -1;
+                    if (Number.isFinite(Number(opts.inputChannel))) inputChannel = Number(opts.inputChannel);
                     // Fresh profile → monitoring AUDIBLE (the native engine boots
                     // muted); a saved preference always wins.
                     const monitorMute = saved && typeof saved.monitorMute === 'boolean' ? saved.monitorMute : false;
@@ -238,7 +317,9 @@
                     // If the engine already runs with exactly this device, don't
                     // tear it down (a redundant setDevice stops/starts the stream);
                     // converge the monitoring prefs and persist what is ACTUALLY
-                    // bound — ASIO drivers ignore buffer changes while open.
+                    // bound — ASIO drivers ignore buffer changes while open. A
+                    // running engine on a sub-64 buffer (the old 16-sample bind)
+                    // does NOT take this path: it must be rebound at 256+.
                     try {
                         const running = typeof desktopApi.isAudioRunning === 'function'
                             ? await desktopApi.isAudioRunning() : false;
@@ -247,7 +328,8 @@
                             const curInput = cur && cur.input ? String(cur.input) : '';
                             const curType = cur && (cur.inputType || cur.type) ? String(cur.inputType || cur.type) : '';
                             if (curInput && curInput.trim() === String(inputDevice).trim()
-                                && (!curType || curType === String(typeInfo.name))) {
+                                && (!curType || curType === String(typeInfo.name))
+                                && !(cur.blockSize > 0 && cur.blockSize < 64)) {
                                 try { if (typeof desktopApi.setMonitorMute === 'function') await desktopApi.setMonitorMute(monitorMute); } catch (_) {}
                                 try { if (typeof desktopApi.setMonitorKill === 'function') await desktopApi.setMonitorKill(monitorKill); } catch (_) {}
                                 if (cur.output) settings.output = String(cur.output);
@@ -359,6 +441,36 @@
                 // that choice instead of falling back to the original default.
                 let lastTriedKey = null;
 
+                // Generation guard for the async fine-tune refresh: a slow
+                // probe must not fill the selects of a panel the user already
+                // left (or a newer device pick).
+                let fineTuneGen = 0;
+                // Populate the sample-rate / input-channel selects for the
+                // picked device. Keeps the current selection when still
+                // offered; otherwise the saved value when it describes this
+                // same device; otherwise 48000 Hz / the default channel.
+                async function refreshFineTune(key) {
+                    const gen = ++fineTuneGen;
+                    const rateSel = host.querySelector('[data-is-rate]');
+                    const chSel = host.querySelector('[data-is-channel]');
+                    if (!rateSel || !chSel || !key) return;
+                    const resolved = await _resolveSourceForKey(key);
+                    if (gen !== fineTuneGen || !host.contains(rateSel) || !host.contains(chSel)) return;
+                    if (!resolved) return;
+                    const { probe, rates, saved, savedMatches } = resolved;
+                    let preferredRate = rates.includes(48000) ? 48000 : rates[0];
+                    if (savedMatches && rates.includes(Number(saved.sampleRate))) {
+                        preferredRate = Number(saved.sampleRate);
+                    }
+                    _renderRateOptions(rateSel, rates, preferredRate);
+                    const names = (probe && Array.isArray(probe.inputChannels)) ? probe.inputChannels : [];
+                    let preferredChannel = -1;
+                    if (savedMatches && Number.isFinite(Number(saved.inputChannel))) {
+                        preferredChannel = Number(saved.inputChannel);
+                    }
+                    _renderChannelOptions(chSel, names, preferredChannel);
+                }
+
                 function renderPicker() {
                     const fallbackKey = selected ? (selected.logicalSourceKey || selected.sourceId || '') : '';
                     const shownKey = lastTriedKey || fallbackKey;
@@ -366,18 +478,29 @@
                         const k = s.logicalSourceKey || s.sourceId || '';
                         return '<option value="' + esc(k) + '"' + (k && k === shownKey ? ' selected' : '') + '>' + esc(s.label || 'Input') + '</option>';
                     }).join('');
-                    const body =
-                        '<p class="text-sm text-fb-textDim">Pick your audio input, then run the calibration to set levels, channel and latency.</p>' +
-                        (sources.length
-                            ? '<label class="block text-xs uppercase tracking-wider text-fb-textDim mt-3 mb-1">Audio input</label>' +
-                              '<select data-is-audio class="w-full bg-gray-800/50 border border-gray-700 rounded-md px-2 py-1.5 text-sm text-fb-text outline-none">' + opts2 + '</select>'
-                            : '<p class="text-sm text-fb-accent mt-2">No audio input detected yet — plug in your interface, or skip and set this up later.</p>') +
-                        (!detectorReady ? '<p data-is-detector-note class="text-xs text-fb-textDim mt-3">The note detector isn’t loaded here — you can calibrate later from the player.</p>' : '');
                     // Desktop: the picker is a real step. Choose the interface,
                     // then test it (binds the native engine + live meter) before
                     // calibrating. Web (no native engine): keep the old flow,
                     // pick + Continue straight into the calibration wizard.
                     const testable = canDriveEngine && sources.length > 0;
+                    // Fine-tune controls (sample rate + input channel) only
+                    // make sense when we can drive the native engine.
+                    const fineTuneHtml = testable
+                        ? '<div class="grid grid-cols-2 gap-2 mt-2">' +
+                          '<div><label class="block text-xs uppercase tracking-wider text-fb-textDim mb-1">Sample rate</label>' +
+                          '<select data-is-rate class="w-full bg-gray-800/50 border border-gray-700 rounded-md px-2 py-1.5 text-sm text-fb-text outline-none"></select></div>' +
+                          '<div><label class="block text-xs uppercase tracking-wider text-fb-textDim mb-1">Input channel</label>' +
+                          '<select data-is-channel class="w-full bg-gray-800/50 border border-gray-700 rounded-md px-2 py-1.5 text-sm text-fb-text outline-none"></select></div>' +
+                          '</div>'
+                        : '';
+                    const body =
+                        '<p class="text-sm text-fb-textDim">Pick your audio input, then run the calibration to set levels, channel and latency.</p>' +
+                        (sources.length
+                            ? '<label class="block text-xs uppercase tracking-wider text-fb-textDim mt-3 mb-1">Audio input</label>' +
+                              '<select data-is-audio class="w-full bg-gray-800/50 border border-gray-700 rounded-md px-2 py-1.5 text-sm text-fb-text outline-none">' + opts2 + '</select>' +
+                              fineTuneHtml
+                            : '<p class="text-sm text-fb-accent mt-2">No audio input detected yet — plug in your interface, or skip and set this up later.</p>') +
+                        (!detectorReady ? '<p data-is-detector-note class="text-xs text-fb-textDim mt-3">The note detector isn’t loaded here — you can calibrate later from the player.</p>' : '');
                     const foot = testable
                         ? '<button type="button" data-is-test class="bg-fb-primary hover:bg-fb-primaryHi text-white px-5 py-2 rounded-md font-medium">Test input</button>'
                         : '<button type="button" data-is-cal class="bg-fb-primary hover:bg-fb-primaryHi text-white px-5 py-2 rounded-md font-medium">' +
@@ -388,8 +511,12 @@
                     if (sel) {
                         // Changing the dropdown only commits the choice; the
                         // "Test input" button binds the engine and starts the
-                        // sound test, so a wrong pick never half-applies.
-                        sel.addEventListener('change', () => { commitAudio(sel.value); });
+                        // sound test, so a wrong pick never half-applies. The
+                        // fine-tune selects follow the new device.
+                        sel.addEventListener('change', () => {
+                            commitAudio(sel.value);
+                            refreshFineTune(sel.value);
+                        });
                         // The <select> shows its first option by default, but no `change`
                         // fires for that implicit pick — so on a first run with nothing yet
                         // selected, audio-input would calibrate against the wrong/no source.
@@ -397,20 +524,26 @@
                         // one calibrated (idempotent if it was already selected).
                         if (!selected && !lastTriedKey) commitAudio(sel.value);
                     }
+                    if (testable && sel) refreshFineTune(sel.value);
                     const testBtn = host.querySelector('[data-is-test]');
                     if (testBtn) {
                         testBtn.addEventListener('click', () => {
                             const key = sel ? sel.value : '';
                             if (!key) return;
                             commitAudio(key);
-                            enterTest(key).catch(() => {});
+                            const rateSel = host.querySelector('[data-is-rate]');
+                            const chSel = host.querySelector('[data-is-channel]');
+                            enterTest(key, {
+                                sampleRate: rateSel && rateSel.value !== '' ? Number(rateSel.value) : NaN,
+                                inputChannel: chSel && chSel.value !== '' ? Number(chSel.value) : NaN,
+                            }).catch(() => {});
                         });
                     } else {
                         host.querySelector('[data-is-cal]').addEventListener('click', onCalibrateClick);
                     }
                 }
 
-                async function enterTest(key) {
+                async function enterTest(key, opts) {
                     if (!key) { renderPicker(); return; }
                     lastTriedKey = key;
                     stopMeter();
@@ -427,7 +560,7 @@
                     const barEl = host.querySelector('[data-is-meter-bar]');
                     host.querySelector('[data-is-nosound]').addEventListener('click', () => { stopMeter(); renderPicker(); });
                     host.querySelector('[data-is-hear]').addEventListener('click', () => { stopMeter(); renderReady(key); });
-                    const applied = await applySourceToEngine(key);
+                    const applied = await applySourceToEngine(key, opts);
                     if (!host.contains(msgEl)) return; // user moved on while applying
                     if (!applied) {
                         msgEl.innerHTML = '<span class="text-fb-accent">Couldn’t open this device — make sure it isn’t in use by another app.</span> Check the meter, then answer below.';
