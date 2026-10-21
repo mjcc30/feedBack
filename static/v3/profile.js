@@ -259,22 +259,25 @@
     }
 
     // ── First-run onboarding (and edit) overlay ───────────────────────────────
-    // First-run is a 3-step flow (spec 010): 1) name + avatar, 2) pick one or
-    // more instrument paths, 3) the calibration challenge offer (play the
-    // diagnostic sloppak at 100% — or skip and reach Mastery Rank 1 anyway).
-    // The profile POST always lands before the step-3 choice so onboarded=1 is
-    // never blocked by the calibration decision. Editing keeps the single form.
+    // First-run flow (spec 010): 1) name + avatar, 2) song directory,
+    // 8) gameplay settings, 3) Feats opt-in, 4) instrument paths + input
+    // setup (the calibration wizard auto-runs inside it), [5) amp sims on
+    // desktop,] 7) the calibration challenge offer (play the diagnostic
+    // sloppak at 100% — or skip and reach Mastery Rank 1 anyway).
+    // The profile POST always lands before the challenge choice so
+    // onboarded=1 is never blocked by the calibration decision. Editing
+    // keeps the single form.
     // Run the input-device setup wizard (the input_setup plugin's
     // `input-calibration` domain) for the chosen instrument paths — BETWEEN path
     // selection and the calibration challenge — so the diagnostic runs against a
     // calibrated input. Capability-idiomatic: dispatch `run` (fire-and-launch)
     // and await the `calibration-done` event. Degrades gracefully when the
     // plugin/runtime is absent so onboarding can never be stranded.
-    // The input-setup panel's "Calibrate" button runs the note detector's
+    // The input-setup step passes autoCalibrate, so the note detector's
     // Calibration Wizard (noise floor, signal level, note detection, timing)
-    // exactly once, right before the calibration challenge — so the
-    // diagnostic's scores rest on a measured input, and the wizard never
-    // relaunches a second time ahead of the challenge.
+    // launches by itself right after the input test — the diagnostic's
+    // scores rest on a measured input, and the wizard never relaunches a
+    // second time ahead of the challenge.
     // Wait (bounded) for the bundled input_setup plugin to finish registering
     // its input-calibration owner. Plugins load asynchronously, so onboarding
     // can reach this step before the plugin is ready — without this wait the
@@ -398,15 +401,54 @@
         // pure-web build has no native amp sims to monitor through, so the step
         // is skipped there. See feedBack-desktop#46.
         const isDesktop = !!window.feedBackDesktop;
-        // The steps this run actually visits. 1–4 always run; 5 (amp sims) is
-        // desktop-only; 7 is the calibration challenge. There is no separate
-        // calibration-wizard step: the input-setup step's "Calibrate" button
-        // already runs the wizard once, ahead of the challenge. Rebuilt by
-        // the step-4 handler; renderDots() draws the strip from it.
-        let stepSeq = [1, 2, 3, 4];
+        // The steps this run actually visits. 1–4 + 8 (gameplay settings,
+        // right after the song directory) always run; 5 (amp sims) is
+        // desktop-only; 7 is the calibration challenge. The calibration
+        // wizard auto-runs inside the input-setup step (step 4's flow), so
+        // there is no separate wizard step. Rebuilt by the step-4 handler;
+        // renderDots() draws the strip from it.
+        let stepSeq = [1, 2, 8, 3, 4];
 
         const stepDots = editing ? '' :
             '<div class="flex justify-center gap-1.5 mt-3" id="v3-ob-dots"></div>';
+
+        // Gameplay-settings controls (step 8) — the same settings as
+        // Settings → Gameplay, with the same fb-switch / slider / select
+        // markup. Values seed from localStorage / /api/settings below;
+        // nothing is written until the user touches a control.
+        const gpLsGet = (k, dflt) => {
+            try { const v = localStorage.getItem(k); return v == null ? dflt : v; }
+            catch (_) { return dflt; }
+        };
+        const gpToggle = (cls, title, desc, checked, avail) =>
+            '<div class="flex items-center gap-2 py-1.5 border-b border-gray-700/50">' +
+            '<div class="flex-1 min-w-0">' +
+            '<div class="text-fb-text text-xs">' + title + '</div>' +
+            '<div class="text-fb-textDim text-[10px]">' + desc + '</div></div>' +
+            '<label class="fb-switch shrink-0' + (avail ? '' : ' opacity-40') + '">' +
+            '<input type="checkbox" id="v3-ob-gp-' + cls + '"' + (checked ? ' checked' : '') + (avail ? '' : ' disabled') + '>' +
+            '<span class="fb-switch-track"></span></label></div>';
+        const gpSlider = (cls, title, desc, value, min, max, step, suffix, avail) =>
+            '<div class="py-1.5 border-b border-gray-700/50">' +
+            '<div class="flex justify-between items-center">' +
+            '<div class="text-fb-text text-xs">' + title + '</div>' +
+            '<span id="v3-ob-gp-' + cls + '-val" class="text-fb-primary text-[11px] font-mono">' + value + suffix + '</span></div>' +
+            '<div class="text-fb-textDim text-[10px] mb-1">' + desc + '</div>' +
+            '<input type="range" id="v3-ob-gp-' + cls + '" class="w-full' + (avail ? '' : ' opacity-40') + '" min="' + min + '" max="' + max + '" step="' + step + '" value="' + value + '"' + (avail ? '' : ' disabled') + '></div>';
+        const gpSelect = (cls, title, desc, value, values, labels, avail) =>
+            '<div class="flex items-center gap-2 py-1.5 border-b border-gray-700/50">' +
+            '<div class="flex-1 min-w-0">' +
+            '<div class="text-fb-text text-xs">' + title + '</div>' +
+            '<div class="text-fb-textDim text-[10px]">' + desc + '</div></div>' +
+            '<select id="v3-ob-gp-' + cls + '" class="bg-gray-800/50 border border-gray-700 rounded px-2 py-1 text-xs text-fb-text shrink-0' + (avail ? '' : ' opacity-40') + '"' + (avail ? '' : ' disabled') + '>' +
+            values.map((v, i) => '<option value="' + v + '"' + (v === value ? ' selected' : '') + '>' + labels[i] + '</option>').join('') +
+            '</select></div>';
+        const gpLeftyOn = !!(window.highway && typeof window.highway.getLefty === 'function'
+            ? window.highway.getLefty()
+            : gpLsGet('lefty', '0') === '1');
+        // Server-persisted values land via the one-shot /api/settings fetch
+        // after the overlay is wired; these are the neutral defaults until then.
+        const gpSaved = { mastery: 100, avMs: 0, arrangement: '', missPenalty: 'none', failBehavior: 'continue' };
 
         const overlay = document.createElement('div');
         overlay.id = 'v3-onboarding';
@@ -438,6 +480,22 @@
             'class="flex-1 bg-gray-800/50 border border-gray-700 rounded-md px-3 py-2 text-sm text-fb-text outline-none focus:border-fb-primary focus:ring-1 focus:ring-fb-primary">' +
             '<button type="button" id="v3-ob-songdir-browse" class="hidden px-3 py-2 rounded-md text-sm bg-gray-800/50 border border-gray-700 text-fb-text hover:border-fb-primary whitespace-nowrap">Browse…</button>' +
             '</div></div>' +
+            // Step 8 — gameplay settings (mirrors Settings → Gameplay; saves as
+            // you go, exactly like the Settings page).
+            '<div id="v3-ob-step8" class="hidden">' +
+            '<label class="block text-xs uppercase tracking-wider text-fb-textDim mb-2">Gameplay settings</label>' +
+            '<p class="text-sm text-fb-textDim mb-3">Quick gameplay preferences — the same settings as <span class="text-fb-text">Settings → Gameplay</span>. Changes save automatically.</p>' +
+            gpToggle('lefty', 'Left-handed mode', 'Invert the note highway.', gpLeftyOn, !!(window.highway && typeof window.highway.setLefty === 'function')) +
+            gpSlider('mastery', 'Note highway speed', 'Master difficulty — 100% plays the full arrangement.', gpSaved.mastery, 0, 100, 5, '%', typeof window.setMastery === 'function') +
+            gpSlider('avoffset', 'A/V sync offset', 'Positive = audio ahead of visuals.', gpSaved.avMs, -1000, 1000, 1, ' ms', typeof window.setAvOffsetMs === 'function') +
+            gpToggle('countdown', 'Countdown before song', 'Four-beat count-in before a song starts.', gpLsGet('countdownBeforeSong', '0') === '1', typeof window.setCountdownBeforeSong === 'function') +
+            gpToggle('upnext', 'Show "Up Next"', 'Upcoming-section pill in the player.', gpLsGet('showUpNext', '1') !== '0', typeof window.setShowUpNext === 'function') +
+            gpToggle('autoplay', 'Autoplay & auto-exit', 'Return to the menu when the score screen closes.', gpLsGet('autoplayExit', '0') === '1', typeof window.setAutoplayExit === 'function') +
+            gpToggle('confirmexit', 'Ask before leaving a song', 'Confirm before exiting a song.', gpLsGet('confirmExitSong', '0') === '1', typeof window.setConfirmExitSong === 'function') +
+            gpSelect('arrangement', 'Default arrangement', 'Which arrangement loads first.', gpSaved.arrangement, ['', 'Lead', 'Rhythm', 'Bass'], ['Most notes (auto)', 'Lead', 'Rhythm', 'Bass'], typeof window.persistSetting === 'function') +
+            gpSelect('misspenalty', 'Miss penalty', 'How harshly misses are scored.', gpSaved.missPenalty, ['none', 'low', 'medium', 'high'], ['None', 'Low', 'Standard', 'High'], typeof window.persistSetting === 'function') +
+            gpSelect('failbehavior', 'Fail behavior', 'What happens when you fail a section.', gpSaved.failBehavior, ['continue', 'restart', 'stop'], ['Continue playing', 'Restart section', 'Stop song'], typeof window.persistSetting === 'function') +
+            '</div>' +
             // Step 3 — Achievements wall opt-in (first-run only; default OFF).
             '<div id="v3-ob-step3" class="hidden">' +
             '<label class="block text-xs uppercase tracking-wider text-fb-textDim mb-2">Feats of Power</label>' +
@@ -494,6 +552,66 @@
         const songDirEl = overlay.querySelector('#v3-ob-songdir');
         const songDirBrowse = overlay.querySelector('#v3-ob-songdir-browse');
 
+        // ── Gameplay settings (step 8) — mirrors Settings → Gameplay ─────
+        // Every control writes through the same global the Settings page
+        // uses, so the two stay in sync. Seed values come from localStorage
+        // (rendered above) and a one-shot /api/settings fetch; nothing is
+        // written until the user touches a control.
+        const gpOn = (id, fn) => {
+            const el = overlay.querySelector('#v3-ob-gp-' + id);
+            if (el) el.addEventListener('change', () => fn(el));
+        };
+        const gpOnInput = (id, fn) => {
+            const el = overlay.querySelector('#v3-ob-gp-' + id);
+            if (el) el.addEventListener('input', () => fn(el));
+        };
+        gpOn('lefty', (el) => {
+            if (window.highway && typeof window.highway.setLefty === 'function') window.highway.setLefty(el.checked);
+        });
+        gpOnInput('mastery', (el) => {
+            const span = overlay.querySelector('#v3-ob-gp-mastery-val');
+            if (span) span.textContent = el.value + '%';
+            if (typeof window.setMastery === 'function') window.setMastery(el.value);
+        });
+        gpOnInput('avoffset', (el) => {
+            const span = overlay.querySelector('#v3-ob-gp-avoffset-val');
+            if (span) span.textContent = el.value + ' ms';
+            if (typeof window.setAvOffsetMs === 'function') window.setAvOffsetMs(el.value);
+        });
+        gpOn('countdown', (el) => { if (typeof window.setCountdownBeforeSong === 'function') window.setCountdownBeforeSong(el.checked); });
+        gpOn('upnext', (el) => { if (typeof window.setShowUpNext === 'function') window.setShowUpNext(el.checked); });
+        gpOn('autoplay', (el) => { if (typeof window.setAutoplayExit === 'function') window.setAutoplayExit(el.checked); });
+        gpOn('confirmexit', (el) => { if (typeof window.setConfirmExitSong === 'function') window.setConfirmExitSong(el.checked); });
+        gpOn('arrangement', (el) => { if (typeof window.persistSetting === 'function') window.persistSetting('default_arrangement', el.value); });
+        gpOn('misspenalty', (el) => { if (typeof window.persistSetting === 'function') window.persistSetting('miss_penalty', el.value); });
+        gpOn('failbehavior', (el) => { if (typeof window.persistSetting === 'function') window.persistSetting('fail_behavior', el.value); });
+        // One-shot load of the persisted server-side values (highway speed,
+        // A/V offset, arrangement, miss penalty, fail behavior); the controls
+        // update in place once they land. Read-only — the setters above are
+        // not called, so loading never writes anything back.
+        fetch('/api/settings').then((r) => (r.ok ? r.json() : null)).then((s) => {
+            if (!s || !overlay.isConnected) return;
+            const num = (v, dflt, min, max) => {
+                const n = Number(v);
+                return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.round(n))) : dflt;
+            };
+            gpSaved.mastery = num(s.master_difficulty, 100, 0, 100);
+            gpSaved.avMs = num(s.av_offset_ms, 0, -1000, 1000);
+            if (typeof s.default_arrangement === 'string') gpSaved.arrangement = s.default_arrangement;
+            if (typeof s.miss_penalty === 'string') gpSaved.missPenalty = s.miss_penalty;
+            if (typeof s.fail_behavior === 'string') gpSaved.failBehavior = s.fail_behavior;
+            const setVal = (id, v) => { const el = overlay.querySelector('#v3-ob-gp-' + id); if (el) el.value = v; };
+            setVal('mastery', gpSaved.mastery);
+            setVal('avoffset', gpSaved.avMs);
+            setVal('arrangement', gpSaved.arrangement);
+            setVal('misspenalty', gpSaved.missPenalty);
+            setVal('failbehavior', gpSaved.failBehavior);
+            const mSpan = overlay.querySelector('#v3-ob-gp-mastery-val');
+            if (mSpan) mSpan.textContent = gpSaved.mastery + '%';
+            const avSpan = overlay.querySelector('#v3-ob-gp-avoffset-val');
+            if (avSpan) avSpan.textContent = gpSaved.avMs + ' ms';
+        }).catch(() => { /* offline — keep the localStorage/default seeds */ });
+
         if (editing && profile) {
             nameEl.value = profile.display_name || '';
         }
@@ -542,7 +660,7 @@
         function setStep(n) {
             step = n;
             errEl.classList.add('hidden');
-            for (let i = 1; i <= 7; i++) {
+            for (let i = 1; i <= 8; i++) {
                 const stepEl = overlay.querySelector('#v3-ob-step' + i);
                 if (stepEl) stepEl.classList.toggle('hidden', i !== n);
             }
@@ -554,6 +672,7 @@
             if (subtitle) {
                 subtitle.textContent = n === 1 ? 'Set up your player profile'
                     : n === 2 ? 'Point us at your songs'
+                    : n === 8 ? 'Gameplay settings'
                     : n === 3 ? 'Feats of Power (optional)'
                     : n === 4 ? 'Choose your instrument paths'
                     : n === 5 ? 'How do you want to monitor?'
@@ -747,12 +866,18 @@
             }
             if (step === 2) {
                 // Save the song directory + kick a library scan, then continue
-                // to the achievements opt-in. "Skip for now" leaves it unconfigured.
+                // to the gameplay settings. "Skip for now" leaves it unconfigured.
                 submit.disabled = true;
                 try {
                     await saveSongDir();
-                    setStep(3);
+                    setStep(nextStepAfter(2));
                 } catch (e) { showErr(e.message || 'Could not set the song directory.'); refreshSubmit(); }
+                return;
+            }
+            if (step === 8) {
+                // Gameplay settings save as you go (same globals as the
+                // Settings page) — nothing to persist here, just continue.
+                setStep(nextStepAfter(8));
                 return;
             }
             if (step === 3) {
@@ -798,12 +923,12 @@
                     // New step: input-device selection + calibration, between
                     // path selection and the note-detect calibration challenge.
                     await runInputSetup(selectedPaths);
-                    // Rebuild the remaining steps: amp sims (desktop only),
-                    // then the challenge. The calibration wizard already ran
-                    // inside the input-setup step above (its "Calibrate"
-                    // button) — no second wizard step, so it never relaunches
-                    // ahead of the challenge.
-                    stepSeq = [1, 2, 3, 4];
+                    // Rebuild the full sequence (gameplay settings included):
+                    // amp sims (desktop only), then the challenge. The
+                    // calibration wizard auto-ran inside the input-setup step
+                    // above (autoCalibrate) — no second wizard step, so it
+                    // never relaunches ahead of the challenge.
+                    stepSeq = [1, 2, 8, 3, 4];
                     if (isDesktop) stepSeq.push(5);
                     stepSeq.push(7);
                     renderDots();
@@ -887,9 +1012,9 @@
 
         skipBtn.addEventListener('click', async () => {
             // Step 2 — skip the song directory (the user can set it later in
-            // Settings). Proceed to the achievements opt-in.
+            // Settings). Proceed to the gameplay settings.
             if (step === 2) {
-                setStep(3);
+                setStep(nextStepAfter(2));
                 return;
             }
             // Calibration challenge (last step) — skip: Mastery Rank 1 immediately,
