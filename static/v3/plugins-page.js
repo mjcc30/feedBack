@@ -184,11 +184,86 @@
 
     // ---- rendering --------------------------------------------------------
 
+    // ---- plugin status section (non-blocking) ------------------------------
+    //
+    // A pedal only shows a pill while its plugin is NOT ready; the status
+    // section under the boards lists EVERY plugin with an explicit state so
+    // "installed or not" is answerable at a glance. Non-blocking by design:
+    // render() only awaits the /api/plugins fetch the page already does, and a
+    // background poller patches just this section (never re-renders the
+    // boards, so an in-progress pedal drag is not disturbed).
+
+    // Status of one plugin as a {key,label,cls} triple. `key` is the stable
+    // machine value ('ready'|'installing'|'failed'|'off'); `label` is what the
+    // status section shows; `cls` is the pill colour class (v3.css). Pure.
+    function statusInfo(p) {
+        var s = (p && p.status) || 'ready';
+        if (s === 'failed') return { key: 'failed', label: 'Failed', cls: 'v3-pill-bad' };
+        if (s === 'installing') return { key: 'installing', label: 'Installing', cls: 'v3-pill-wait' };
+        if (p && p.enabled === false) return { key: 'off', label: 'Off', cls: 'v3-pill-off' };
+        return { key: 'ready', label: 'Installed', cls: 'v3-pill-ok' };
+    }
+
+    // Plugins the user needs first sit at the top of the status section — the
+    // same set as the boot-load priority in static/js/plugin-loader.js and
+    // plugins/__init__.py. Keep the three lists in sync.
+    var STATUS_PRIORITY = ['input_setup', 'input_settings', 'note_detect', 'rig_builder', 'highway_3d'];
+    var _STATUS_RANK = (function () {
+        var m = Object.create(null);
+        STATUS_PRIORITY.forEach(function (id, i) { m[id] = i; });
+        return m;
+    })();
+    function _statusSortRank(p) {
+        var r = _STATUS_RANK[p && p.id];
+        return typeof r === 'number' ? r : STATUS_PRIORITY.length;
+    }
+    function _sortedForStatus(plugins) {
+        // Stable: equal ranks keep the incoming order.
+        return plugins.slice().sort(function (a, b) { return _statusSortRank(a) - _statusSortRank(b); });
+    }
+
+    function statusSummaryText(plugins) {
+        var counts = { ready: 0, installing: 0, failed: 0, off: 0 };
+        plugins.forEach(function (p) { var k = statusInfo(p).key; counts[k] = (counts[k] || 0) + 1; });
+        var total = plugins.length;
+        var parts = [total + ' plugin' + (total === 1 ? '' : 's'), counts.ready + ' installed'];
+        if (counts.installing) parts.push(counts.installing + ' installing');
+        if (counts.failed) parts.push(counts.failed + ' failed');
+        if (counts.off) parts.push(counts.off + ' off');
+        return parts.join(' — ');
+    }
+
+    function statusRowHtml(p) {
+        var info = statusInfo(p);
+        var bundled = p.bundled
+            ? ' <span class="v3-pedal-bundled-inline" title="Ships with FeedBack core">core</span>'
+            : '';
+        return '<tr data-status-id="' + esc(p.id) + '">' +
+            '<td class="v3-plugin-status-name">' + esc(p.name || p.id) + bundled + '</td>' +
+            '<td class="v3-plugin-status-state"><span class="v3-pedal-pill ' + info.cls + '">' + esc(info.label) + '</span></td>' +
+            '</tr>';
+    }
+
+    function statusRowsHtml(plugins) {
+        var rows = _sortedForStatus(plugins).map(statusRowHtml).join('');
+        return rows || '<tr><td colspan="2" class="v3-plugin-status-empty">No plugins installed.</td></tr>';
+    }
+
+    function statusSectionHtml(plugins) {
+        return '<details class="v3-plugin-status" id="v3-plugin-status">' +
+            '<summary class="v3-plugin-status-summary">' + esc(statusSummaryText(plugins)) + '</summary>' +
+            '<div class="v3-plugin-status-body"><table class="v3-plugin-status-table">' +
+            '<thead><tr><th>Plugin</th><th>Status</th></tr></thead>' +
+            '<tbody>' + statusRowsHtml(plugins) + '</tbody>' +
+            '</table></div></details>';
+    }
+
     function statusPill(p) {
-        var s = p.status || 'ready';
-        if (s === 'failed') return '<span class="v3-pedal-pill v3-pill-bad">Failed</span>';
-        if (s === 'installing') return '<span class="v3-pedal-pill v3-pill-wait">Installing</span>';
-        return '';
+        // A ready pedal is the normal case and stays clean; the full status of
+        // every plugin lives in the status section below the boards.
+        var info = statusInfo(p);
+        if (info.key === 'ready' || info.key === 'off') return '';
+        return '<span class="v3-pedal-pill ' + info.cls + '">' + esc(info.label) + '</span>';
     }
 
     function pedalHtml(p) {
@@ -418,6 +493,44 @@
         });
     }
 
+    // ---- live status refresh (non-blocking) --------------------------------
+    //
+    // While the Plugins screen is visible, patch ONLY the status section (and
+    // the "N active" counter) every few seconds. The boards are never
+    // re-rendered here, so pedal drags / positions are undisturbed. The poller
+    // stops itself as soon as the screen is hidden or the section is gone.
+    var STATUS_REFRESH_MS = 3000;
+    var _statusTimer = null;
+    function stopStatusRefresh() {
+        if (_statusTimer) { clearInterval(_statusTimer); _statusTimer = null; }
+    }
+    async function refreshStatusSection() {
+        var root = document.getElementById('v3-plugins');
+        if (!root || !root.classList.contains('active')) { stopStatusRefresh(); return; }
+        var section = document.getElementById('v3-plugin-status');
+        if (!section) { stopStatusRefresh(); return; }
+        var plugins;
+        try {
+            var r = await fetch('/api/plugins');
+            if (!r.ok) return;
+            plugins = await r.json();
+        } catch (e) { return; }  // transient network error — try again next tick
+        if (!Array.isArray(plugins)) return;
+        var summary = section.querySelector('.v3-plugin-status-summary');
+        if (summary) summary.textContent = statusSummaryText(plugins);
+        var tbody = section.querySelector('tbody');
+        if (tbody) tbody.innerHTML = statusRowsHtml(plugins);
+        var counter = document.getElementById('v3-plugins-active-count');
+        if (counter) {
+            var active = plugins.filter(function (p) { return (p.status || 'ready') === 'ready'; }).length;
+            counter.textContent = active + ' active';
+        }
+    }
+    function startStatusRefresh() {
+        stopStatusRefresh();
+        _statusTimer = setInterval(refreshStatusSection, STATUS_REFRESH_MS);
+    }
+
     async function render() {
         var root = document.getElementById('v3-plugins');
         if (!root) return;
@@ -450,7 +563,7 @@
         root.innerHTML =
             '<div class="v3-pedalboards-wrap px-6 md:px-8 pb-10">' +
             '<div class="flex items-center justify-between gap-3 mb-6 flex-wrap">' +
-            '<span class="text-lg font-medium text-fb-good">' + active + ' active</span>' +
+            '<span class="text-lg font-medium text-fb-good" id="v3-plugins-active-count">' + active + ' active</span>' +
             '<div class="flex items-center gap-2">' +
             '<button id="v3-pedal-reset" class="text-sm bg-fb-card/60 hover:bg-fb-card border border-fb-border/50 text-fb-textDim hover:text-fb-text px-3 py-1.5 rounded-md" title="Reset pedal positions and re-roll skins">Reset</button>' +
             (inspectorPresent
@@ -458,6 +571,7 @@
                 : '') +
             '</div></div>' +
             (boardsHtml || '<p class="text-fb-textDim text-sm">No plugins installed.</p>') +
+            statusSectionHtml(plugins) +
             '</div>';
 
         // Bind plugin objects to pedal elements + lay them out + wire drag.
@@ -541,6 +655,10 @@
                 window.showScreen('plugin-capability_inspector');
             }
         });
+
+        // Live-patch the status section while this screen is visible. The
+        // poller self-terminates on screen change; render() re-arms it.
+        startStatusRefresh();
     }
 
     window.v3PluginsPage = {
@@ -548,6 +666,9 @@
         // Pure helpers exposed for unit tests.
         _test: {
             categoryOf: categoryOf, thumbUrl: thumbUrl, settingsTarget: settingsTarget,
+            statusInfo: statusInfo, statusSummaryText: statusSummaryText,
+            statusRowsHtml: statusRowsHtml, statusSectionHtml: statusSectionHtml,
+            _sortedForStatus: _sortedForStatus, STATUS_PRIORITY: STATUS_PRIORITY,
             clampToBoard: clampToBoard, defaultSlot: defaultSlot,
             loadLayout: loadLayout, saveLayout: saveLayout,
             frameFor: frameFor, pickFrame: pickFrame, frameUrl: frameUrl,

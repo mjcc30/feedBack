@@ -147,6 +147,69 @@ test('loadCollapsed/saveCollapsed: round-trip + corruption tolerance', () => {
     assert.deepEqual(t.loadCollapsed(), {});
 });
 
+test('statusInfo: ready=Installed, installing, failed, off', () => {
+    const { t } = loadPage();
+    assert.deepEqual(t.statusInfo({ id: 'a' }), { key: 'ready', label: 'Installed', cls: 'v3-pill-ok' });
+    assert.deepEqual(t.statusInfo({ id: 'a', status: 'ready' }), { key: 'ready', label: 'Installed', cls: 'v3-pill-ok' });
+    assert.deepEqual(t.statusInfo({ id: 'a', status: 'installing' }), { key: 'installing', label: 'Installing', cls: 'v3-pill-wait' });
+    assert.deepEqual(t.statusInfo({ id: 'a', status: 'failed' }), { key: 'failed', label: 'Failed', cls: 'v3-pill-bad' });
+    assert.deepEqual(t.statusInfo({ id: 'a', enabled: false }), { key: 'off', label: 'Off', cls: 'v3-pill-off' });
+    // failed wins over enabled:false (a broken plugin is not merely "off")
+    assert.equal(t.statusInfo({ id: 'a', status: 'failed', enabled: false }).key, 'failed');
+    // null/undefined plugin is treated as ready, never throws
+    assert.equal(t.statusInfo(null).key, 'ready');
+});
+
+test('statusSummaryText: counts every state, singular/plural, omits zero counts', () => {
+    const { t } = loadPage();
+    assert.equal(t.statusSummaryText([]), '0 plugins — 0 installed');
+    assert.equal(t.statusSummaryText([{ id: 'a' }]), '1 plugin — 1 installed');
+    assert.equal(
+        t.statusSummaryText([
+            { id: 'a' },
+            { id: 'b', status: 'installing' },
+            { id: 'c', status: 'failed' },
+            { id: 'd', enabled: false },
+        ]),
+        '4 plugins — 1 installed — 1 installing — 1 failed — 1 off',
+    );
+});
+
+test('_sortedForStatus: priority plugins first, stable within groups', () => {
+    const { t } = loadPage();
+    const input = [
+        { id: 'zzz' }, { id: 'highway_3d' }, { id: 'aaa' },
+        { id: 'input_setup' }, { id: 'note_detect' }, { id: 'mmm' },
+    ];
+    const out = t._sortedForStatus(input).map((p) => p.id);
+    // priority plugins first (in STATUS_PRIORITY order), the rest keep their
+    // incoming order (stable sort — alphabetical sorting happens upstream)
+    assert.deepEqual(out, ['input_setup', 'note_detect', 'highway_3d', 'zzz', 'aaa', 'mmm']);
+    // input array is not mutated
+    assert.deepEqual(input.map((p) => p.id), ['zzz', 'highway_3d', 'aaa', 'input_setup', 'note_detect', 'mmm']);
+});
+
+test('statusRowsHtml: one row per plugin, priority first, empty state', () => {
+    const { t } = loadPage();
+    const html = t.statusRowsHtml([
+        { id: 'b_plugin', name: 'B Plugin' },
+        { id: 'input_setup', name: 'Input Setup', bundled: true },
+    ]);
+    assert.ok(html.indexOf('data-status-id="input_setup"') !== -1);
+    assert.ok(html.indexOf('data-status-id="input_setup"') < html.indexOf('data-status-id="b_plugin"'));
+    assert.ok(html.indexOf('>Installed<') !== -1);
+    assert.ok(html.indexOf('v3-pedal-bundled-inline') !== -1);
+    assert.ok(t.statusRowsHtml([]).indexOf('No plugins installed.') !== -1);
+});
+
+test('statusSectionHtml: wraps rows in a details section with a summary', () => {
+    const { t } = loadPage();
+    const html = t.statusSectionHtml([{ id: 'a', name: 'A' }]);
+    assert.ok(html.indexOf('<details class="v3-plugin-status" id="v3-plugin-status">') !== -1);
+    assert.ok(html.indexOf('1 plugin — 1 installed') !== -1);
+    assert.ok(html.indexOf('<tbody>') !== -1);
+});
+
 test('DRAG_THRESHOLD is a small positive pixel budget', () => {
     const { t } = loadPage();
     assert.equal(typeof t.DRAG_THRESHOLD, 'number');
