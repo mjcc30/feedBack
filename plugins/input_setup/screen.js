@@ -150,6 +150,7 @@
     // returned promise to { completed:[...], skipped:[...] } when finished.
     function _runWizard(opts) {
         opts = opts || {};
+        const autoCalibrate = !!opts.autoCalibrate;
         const instruments = (Array.isArray(opts.instruments) ? opts.instruments : [])
             .map((i) => String(i).toLowerCase()).filter((i) => INSTRUMENTS[i]);
         // De-dupe keys/piano (same MIDI flow under one label).
@@ -175,7 +176,7 @@
             let _activeCleanup = null;
             function next() {
                 if (idx >= queue.length) { finish(); return; }
-                renderPanel(queue[idx]);
+                renderPanel(queue[idx], autoCalibrate);
             }
             function advance(inst, didComplete) {
                 if (_activeCleanup) { try { _activeCleanup(); } catch (_) {} _activeCleanup = null; }
@@ -199,9 +200,9 @@
             }
 
             // ── per-instrument panels ───────────────────────────────────────
-            async function renderPanel(inst) {
+            async function renderPanel(inst, autoCalibrate) {
                 const meta = INSTRUMENTS[inst];
-                if (meta.mode === 'audio') return renderAudioPanel(inst);
+                if (meta.mode === 'audio') return renderAudioPanel(inst, autoCalibrate);
                 return renderMidiPanel(inst);
             }
 
@@ -210,7 +211,7 @@
             // persisted), confirm the guitar is audible (live meter), then launch
             // the note_detect Calibration Wizard for the deep work (noise
             // floor / signal level / open-string detection / timing).
-            async function renderAudioPanel(inst) {
+            async function renderAudioPanel(inst, autoCalibrate) {
                 const { sources, selected } = await _audioSources();
                 const desktopApi = (window.feedBackDesktop && window.feedBackDesktop.audio) || null;
                 const canDriveEngine = !!(desktopApi
@@ -414,6 +415,7 @@
                 // Bounded wait for the note detector; upgrades the Calibrate
                 // button in place when it registers (boot load-order race).
                 let detectTimer = null;
+                let autoCalTimer = null;
                 if (!detectorReady) {
                     const t0 = Date.now();
                     detectTimer = setInterval(() => {
@@ -424,12 +426,14 @@
                             if (b) b.textContent = 'Calibrate';
                             const n = host.querySelector('[data-is-detector-note]');
                             if (n) n.remove();
+                            maybeAutoCalibrate();
                         } else if (Date.now() - t0 >= 10000) {
                             if (detectTimer) { clearInterval(detectTimer); detectTimer = null; }
                         }
                     }, 100);
                 }
                 _activeCleanup = () => {
+                    if (autoCalTimer) { clearInterval(autoCalTimer); autoCalTimer = null; }
                     if (detectTimer) { clearInterval(detectTimer); detectTimer = null; }
                     stopMeter();
                 };
@@ -448,7 +452,19 @@
                         const ov = document.getElementById('input-setup-overlay');
                         const prevDisplay = ov ? ov.style.display : '';
                         if (ov) ov.style.display = 'none';
+                        // Defensive: the calibration wizard minimizes to a
+                        // transparent layer over the song highway for its
+                        // play-along test, so while it runs a song must never
+                        // render behind this overlay — keep it hidden for the
+                        // whole song, not just until the wizard reports back.
+                        const bus = window.feedBack;
+                        const keepHiddenOnPlay = () => {
+                            const o = document.getElementById('input-setup-overlay');
+                            if (o) o.style.display = 'none';
+                        };
+                        if (bus && typeof bus.on === 'function') bus.on('song:play', keepHiddenOnPlay);
                         const restore = () => {
+                            if (bus && typeof bus.off === 'function') bus.off('song:play', keepHiddenOnPlay);
                             const o = document.getElementById('input-setup-overlay');
                             if (o) o.style.display = prevDisplay;
                         };
@@ -460,6 +476,33 @@
                     } else {
                         advance(inst, true);
                     }
+                }
+
+                // Onboarding auto-calibrate: when the caller asks for it
+                // (first-run onboarding flow), start the note_detect
+                // Calibration Wizard by itself as soon as the detector is
+                // ready and a Calibrate button is on screen (the ready panel
+                // on desktop, the picker on web). Bounded 10s wait on the
+                // detector; cleaned up with the panel.
+                let autoCalFired = false;
+                function maybeAutoCalibrate() {
+                    if (!autoCalibrate || autoCalFired || !detectorReady) return;
+                    if (!host.querySelector('[data-is-cal]')) return;
+                    autoCalFired = true;
+                    if (autoCalTimer) { clearInterval(autoCalTimer); autoCalTimer = null; }
+                    onCalibrateClick();
+                }
+                if (autoCalibrate && !detectorReady) {
+                    const t0 = Date.now();
+                    autoCalTimer = setInterval(() => {
+                        if (window.noteDetect && typeof window.noteDetect.launchCalibration === 'function') {
+                            detectorReady = true;
+                        }
+                        maybeAutoCalibrate();
+                        if (autoCalFired || Date.now() - t0 >= 10000) {
+                            if (autoCalTimer) { clearInterval(autoCalTimer); autoCalTimer = null; }
+                        }
+                    }, 100);
                 }
 
                 // Last source tried in the sound test, so the picker re-opens on
@@ -579,6 +622,9 @@
                     } else {
                         host.querySelector('[data-is-cal]').addEventListener('click', onCalibrateClick);
                     }
+                    // Onboarding: no click needed — auto-launch as soon as a
+                    // Calibrate button is on screen and the detector is ready.
+                    maybeAutoCalibrate();
                 }
 
                 async function enterTest(key, opts) {
@@ -618,6 +664,7 @@
                         (detectorReady ? 'Calibrate' : 'Continue') + '</button>';
                     shell(inst, body, foot);
                     host.querySelector('[data-is-cal]').addEventListener('click', onCalibrateClick);
+                    maybeAutoCalibrate();
                 }
 
                 renderPicker();
@@ -753,7 +800,11 @@
                 // one is open is a no-op (single overlay).
                 run: (ctx) => {
                     const instruments = ((ctx.payload || {}).instruments) || [];
-                    if (!document.getElementById('input-setup-overlay')) launch(instruments);
+                    // Onboarding passes autoCalibrate so the calibration
+                    // wizard launches by itself once the input is tested;
+                    // Settings re-entry never does.
+                    const autoCalibrate = !!((ctx.payload || {}).autoCalibrate);
+                    if (!document.getElementById('input-setup-overlay')) launch(instruments, { autoCalibrate });
                     return { outcome: 'handled', payload: { started: true, instruments } };
                 },
             },
@@ -763,17 +814,17 @@
     // ── public surface (onboarding + Settings re-entry) ──────────────────────
     function mount(container, options) {
         options = options || {};
-        return _runWizard({ host: container, instruments: options.instruments || [], onComplete: options.onComplete, onSkip: options.onSkip });
+        return _runWizard({ host: container, instruments: options.instruments || [], autoCalibrate: !!options.autoCalibrate, onComplete: options.onComplete, onSkip: options.onSkip });
     }
 
-    function launch(instruments) {
+    function launch(instruments, opts) {
         const overlay = document.createElement('div');
         overlay.id = 'input-setup-overlay';
         overlay.className = 'fixed inset-0 z-[210] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4';
         overlay.innerHTML = '<div class="bg-fb-card rounded-xl border border-fb-border/50 w-full max-w-lg p-6" data-is-host></div>';
         document.body.appendChild(overlay);
         const host = overlay.querySelector('[data-is-host]');
-        return _runWizard({ host, instruments: instruments || [] }).then((r) => { overlay.remove(); return r; });
+        return _runWizard({ host, instruments: instruments || [], autoCalibrate: !!(opts && opts.autoCalibrate) }).then((r) => { overlay.remove(); return r; });
     }
 
     window.feedBackInputSetup = {

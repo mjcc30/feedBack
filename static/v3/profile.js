@@ -369,7 +369,7 @@
         try {
             const caps = window.feedBack && window.feedBack.capabilities;
             if (!caps || typeof caps.command !== 'function') {
-                try { await window.feedBackInputSetup.launch(instruments); } catch (e) { /* proceed */ }
+                try { await window.feedBackInputSetup.launch(instruments, { autoCalibrate: true }); } catch (e) { /* proceed */ }
                 return;
             }
             await new Promise((resolve) => {
@@ -380,7 +380,7 @@
                 // `run` is fire-and-launch; completion arrives via the event above.
                 // A non-handled outcome (no owner / plugin absent / error) means
                 // nothing was launched, so proceed immediately.
-                caps.command('input-calibration', 'run', { requester: 'onboarding', payload: { instruments } })
+                caps.command('input-calibration', 'run', { requester: 'onboarding', payload: { instruments, autoCalibrate: true } })
                     .then((r) => { if (!r || r.outcome !== 'handled') done(); })
                     .catch(() => done());
             });
