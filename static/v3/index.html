@@ -673,6 +673,22 @@
                             <button onclick="saveSettings()" class="bg-accent hover:bg-accent-light px-6 py-2.5 rounded-xl text-sm font-semibold text-white transition">Save</button>
                         </div>
                     </div>
+                    <!-- VST crash blocklist (desktop app only — hidden on the web
+                         build, which has no window.feedBackDesktop.vst bridge) -->
+                    <div class="fb-srow fb-srow-stack" id="vst-crash-blocklist-card" style="display:none">
+                        <div style="display:flex; align-items:center; gap:1rem;">
+                            <span class="fb-srow-icon"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg></span>
+                            <div class="fb-srow-main">
+                                <div class="fb-srow-title">Blocked plugins (crash guard)</div>
+                                <div class="fb-srow-desc">These plugins crashed the app 5 times in a row, so they now load in the sandbox. Remove an entry to let it load normally again — it will be re-blocked after 5 new consecutive crashes.</div>
+                            </div>
+                        </div>
+                        <div id="vst-crash-blocklist-list" style="display:flex; flex-direction:column; gap:0.5rem; width:100%;"></div>
+                        <div class="fb-srow-control">
+                            <button type="button" id="vst-crash-blocklist-clear"
+                                class="bg-dark-600 hover:bg-dark-500 px-5 py-2.5 rounded-xl text-sm text-gray-300 transition">Clear all</button>
+                        </div>
+                    </div>
                 </div>
             </div>
 

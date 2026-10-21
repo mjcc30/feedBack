@@ -175,6 +175,95 @@
         });
     }
 
+    // ── VST crash blocklist (desktop app only) ────────────────────────────
+    // The desktop crash guard blocklists a VST after 5 consecutive crashes of
+    // the same op (load/editor); blocklisted plugins load in the sandbox. This
+    // card (Audio tab) lists them so an entry can be removed or the list
+    // cleared — a plugin that works fine must always have a way back. A toast
+    // announces a fresh block (the vst:pluginBlocked push from the main
+    // process, flushed once the renderer has painted).
+    var vstBlocklistWired = false;
+
+    function vstBridge() {
+        try {
+            var d = window.feedBackDesktop;
+            return (d && d.vst && typeof d.vst.getCrashBlocklist === 'function') ? d.vst : null;
+        } catch (_) { return null; }
+    }
+
+    function renderVstCrashBlocklist() {
+        var card = document.getElementById('vst-crash-blocklist-card');
+        var list = document.getElementById('vst-crash-blocklist-list');
+        if (!card || !list) return;
+        var vst = vstBridge();
+        if (!vst) { card.style.display = 'none'; return; } // web build
+        card.style.display = '';
+        Promise.resolve(vst.getCrashBlocklist()).then(function (paths) {
+            paths = Array.isArray(paths) ? paths : [];
+            if (!paths.length) {
+                list.innerHTML = '<p class="fb-tabpanel-empty">No blocked plugins.</p>';
+                return;
+            }
+            var html = '';
+            paths.forEach(function (p) {
+                html += '<div class="fb-srow" style="padding:0.5rem 0;">'
+                    + '<div class="fb-srow-main"><div class="fb-srow-title" style="font-weight:normal; font-size:0.8rem; word-break:break-all;">' + esc(p) + '</div></div>'
+                    + '<div class="fb-srow-control"><button type="button" class="vst-blocklist-remove bg-dark-600 hover:bg-dark-500 px-4 py-1.5 rounded-xl text-xs text-gray-300 transition" data-path="' + esc(p) + '">Remove</button></div>'
+                    + '</div>';
+            });
+            list.innerHTML = html;
+            Array.prototype.forEach.call(list.querySelectorAll('.vst-blocklist-remove'), function (btn) {
+                btn.addEventListener('click', function () {
+                    vst.removeFromCrashBlocklist(btn.getAttribute('data-path'))
+                        .then(function () { renderVstCrashBlocklist(); });
+                });
+            });
+        }).catch(function () {
+            list.innerHTML = '<p class="fb-tabpanel-empty">The crash blocklist is unavailable.</p>';
+        });
+    }
+
+    function wireVstCrashBlocklist() {
+        if (vstBlocklistWired) return;
+        var vst = vstBridge();
+        if (!vst) return; // web build — no desktop bridge, the card stays hidden
+        vstBlocklistWired = true;
+
+        var clearBtn = document.getElementById('vst-crash-blocklist-clear');
+        if (clearBtn) {
+            clearBtn.addEventListener('click', function () {
+                var confirmFn = (typeof window._confirmDialog === 'function')
+                    ? window._confirmDialog({
+                        title: 'Clear the plugin blocklist',
+                        body: '<p class="text-sm text-gray-300">Let every blocked plugin load normally again? A plugin that crashes again will be re-blocked after 5 consecutive crashes.</p>',
+                        confirmText: 'Clear', cancelText: 'Cancel', danger: true,
+                    })
+                    : Promise.resolve(window.confirm('Clear the whole plugin blocklist?'));
+                confirmFn.then(function (ok) {
+                    if (!ok) return;
+                    vst.clearCrashBlocklist().then(function () { renderVstCrashBlocklist(); });
+                });
+            });
+        }
+        if (typeof vst.onPluginBlocked === 'function') {
+            vst.onPluginBlocked(function (payload) {
+                try {
+                    var name = String(payload && payload.path || '').split(/[\/]/).pop() || 'A plugin';
+                    if (window.fbNotify && typeof window.fbNotify.show === 'function') {
+                        window.fbNotify.show({
+                            title: 'Plugin blocked',
+                            message: name + ' crashed the app ' + (payload && payload.count || 5) + ' times in a row. It will now load in the sandbox.',
+                            accent: '#EF4444',
+                            durationMs: 8000,
+                        });
+                    }
+                } catch (_) { /* noop */ }
+                renderVstCrashBlocklist();
+            });
+        }
+        renderVstCrashBlocklist();
+    }
+
     // ── Boot + refresh on settings entry ──────────────────────────────────
     function init() {
         if (!document.getElementById('settings-tabbar')) return; // not the v3 page
@@ -182,6 +271,7 @@
         wireResets();
         renderKeybinds();
         refreshEmptyStates();
+        wireVstCrashBlocklist();
         // Safety net for plugin-panel injection ordering: tell app.js the
         // settings containers exist now (it injects plugin <details> into the
         // per-category containers). Harmless if no listener is attached.
@@ -196,6 +286,7 @@
                 // Plugin panels (and shortcuts) may have mounted since the last
                 // visit — re-derive the dynamic bits on every Settings entry.
                 wireTabs(); wireResets(); renderKeybinds(); refreshEmptyStates();
+                wireVstCrashBlocklist(); renderVstCrashBlocklist();
             }
         });
     }
