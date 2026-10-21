@@ -46,6 +46,34 @@ function _pluginNav(plugin) {
     return plugin.nav || null;
 }
 
+// Boot-load priority: at startup the sequential screen/script injection loop
+// hydrates these plugins FIRST — they are the ones the user needs immediately
+// (onboarding input setup + calibration, note detection for the challenge,
+// the rig builder tone chain, the default 3D highway). The nav dropdown and
+// the settings panels keep their alphabetical order (they are built from
+// `plugins`, not from the load order); only the injection loop follows this
+// priority. Keep in sync with STATUS_PRIORITY in static/v3/plugins-page.js
+// and _BOOT_LOAD_PRIORITY in plugins/__init__.py.
+const BOOT_LOAD_PRIORITY = [
+    'input_setup',      // Input Setup — onboarding + per-instrument calibration
+    'input_settings',   // Input Settings — reserved id, prioritized if present
+    'note_detect',      // Note Detection — onboarding challenge
+    'rig_builder',      // Rig Builder — live tone chain
+    'highway_3d',       // 3D Highway — default visualization
+];
+const _BOOT_PRIORITY_RANK = new Map(BOOT_LOAD_PRIORITY.map((id, i) => [id, i]));
+function _bootLoadOrder(plugins) {
+    // Stable sort: plugins outside the priority list keep their incoming
+    // (alphabetical) order after the prioritized ones. Returns a new array —
+    // the input (nav source) is never mutated.
+    return plugins.slice().sort((a, b) => {
+        const ra = _BOOT_PRIORITY_RANK.has(a.id) ? _BOOT_PRIORITY_RANK.get(a.id) : BOOT_LOAD_PRIORITY.length;
+        const rb = _BOOT_PRIORITY_RANK.has(b.id) ? _BOOT_PRIORITY_RANK.get(b.id) : BOOT_LOAD_PRIORITY.length;
+        return ra - rb;
+    });
+}
+
+
 async function _commandUiDomain(domain, command, plugin, payload) {
     try {
         if (!window.feedBack?.capabilities?.command) return;
@@ -133,6 +161,11 @@ export async function loadPlugins() {
             const nameDelta = String(a.name || a.id || '').localeCompare(String(b.name || b.id || ''));
             return nameDelta || String(a.id || '').localeCompare(String(b.id || ''));
         });
+        // Hydration order for the injection loop further below: prioritized
+        // plugins first, the rest alphabetical. `plugins` itself stays
+        // alphabetical — the nav dropdown and settings panels are built from
+        // it, so their order is unchanged.
+        const loadOrder = _bootLoadOrder(plugins);
         // NOTE deliberately NO stale-contribution sweep for plugins absent
         // from this response. Absent ≠ uninstalled: the backend clears its
         // plugin registry at the start of load_plugins() and repopulates it
@@ -478,7 +511,10 @@ export async function loadPlugins() {
         // before (re)injecting for the current set.
         _reconcilePluginStyles(plugins);
 
-        for (const plugin of plugins) {
+        // Injection loop: follow the boot-load priority (input_setup,
+        // note_detect, rig_builder, highway_3d, … first) so the plugins the
+        // user needs at startup are hydrated before everything else.
+        for (const plugin of loadOrder) {
             try {
             // Only ready plugins have their assets available (the backend
             // guards screen.html/screen.js/settings.html on status=="ready").
