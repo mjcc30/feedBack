@@ -289,6 +289,71 @@
         });
     }
 
+    // Wait (bounded) for the note detector plugin to install its playSong
+    // wrapper — that happens at the very END of its (huge, deferred)
+    // screen.js. Launching the diagnostic before the wrapper exists leaves
+    // note detection OFF: with no wrapper there is no re-arm on song load,
+    // so the challenge hears nothing on its first run (the user had to exit
+    // the test and relaunch it manually).
+    function waitForNoteDetector(timeoutMs) {
+        const ready = () => !!(window.noteDetect
+            && typeof window.noteDetect.injectButton === 'function'
+            && typeof window.playSong === 'function'
+            && window.playSong._ndWrapped === true);
+        return new Promise((resolve) => {
+            if (ready()) { resolve(true); return; }
+            const t0 = Date.now();
+            const iv = setInterval(() => {
+                if (ready()) { clearInterval(iv); resolve(true); }
+                else if (Date.now() - t0 >= timeoutMs) { clearInterval(iv); resolve(false); }
+            }, 100);
+        });
+    }
+
+    // ── Tuner step helpers (step 6, between input setup and the challenge) ──
+    // The tuner plugin exposes an embeddable panel: enable() starts it (it
+    // drives the native engine itself on desktop), embedInto() reparents the
+    // panel into our host div, unembed() + disable() tear it down. The enter
+    // is generation-guarded so a slow enable() can never re-embed the panel
+    // after the user has already moved on to another step.
+    let _tunerEnterGen = 0;
+    function waitForTuner(timeoutMs) {
+        const ready = () => !!(window.tuner
+            && typeof window.tuner.enable === 'function'
+            && typeof window.tuner.embedInto === 'function');
+        return new Promise((resolve) => {
+            if (ready()) { resolve(true); return; }
+            const t0 = Date.now();
+            const iv = setInterval(() => {
+                if (ready()) { clearInterval(iv); resolve(true); }
+                else if (Date.now() - t0 >= timeoutMs) { clearInterval(iv); resolve(false); }
+            }, 100);
+        });
+    }
+    async function enterTuneStep(host) {
+        const gen = ++_tunerEnterGen;
+        if (!host) return;
+        host.innerHTML = '<p class="text-sm text-fb-textDim">Opening tuner…</p>';
+        if (!(await waitForTuner(8000))) {
+            if (gen !== _tunerEnterGen) return;
+            host.innerHTML = '<p class="text-sm text-fb-textDim">The tuner isn’t loaded here — you can tune later from the player.</p>';
+            return;
+        }
+        try {
+            await window.tuner.enable();
+            if (gen !== _tunerEnterGen) { try { window.tuner.disable(); } catch (_) {} return; }
+            if (!window.tuner.embedInto(host)) throw new Error('embed failed');
+        } catch (_) {
+            if (gen !== _tunerEnterGen) return;
+            host.innerHTML = '<p class="text-sm text-fb-textDim">The tuner couldn’t start — check the input device, or tune later from the player.</p>';
+        }
+    }
+    function leaveTuneStep() {
+        _tunerEnterGen++;
+        try { if (window.tuner && typeof window.tuner.unembed === 'function') window.tuner.unembed(); } catch (_) {}
+        try { if (window.tuner && typeof window.tuner.disable === 'function') window.tuner.disable(); } catch (_) {}
+    }
+
     async function runInputSetup(paths) {
         const instruments = (Array.isArray(paths) ? paths : []).map((p) => String(p).toLowerCase());
         if (!instruments.length) return;
@@ -336,15 +401,17 @@
 
         // The amp-sim opt-in step (step 5) only exists in the desktop app — the
         // pure-web build has no native amp sims to monitor through, so the step
-        // is skipped there (calibration is the last step at index 5 on web, 6 on
-        // desktop). See feedBack-desktop#46.
+        // is skipped there. See feedBack-desktop#46.
         const isDesktop = !!window.feedBackDesktop;
-        const lastStep = isDesktop ? 6 : 5;
+        // The steps this run actually visits. 1–4 always run; 5 (amp sims) is
+        // desktop-only; 6 (tuner) only when an audio path (guitar/bass) was
+        // picked — MIDI-only players have nothing to tune; 7 is the
+        // calibration challenge. Rebuilt by the step-4 handler once the path
+        // picks are known; renderDots() draws the strip from it.
+        let stepSeq = [1, 2, 3, 4];
 
         const stepDots = editing ? '' :
-            '<div class="flex justify-center gap-1.5 mt-3" id="v3-ob-dots">' +
-            Array.from({ length: lastStep }, (_, i) => i + 1).map((n) => '<span data-dot="' + n + '" class="w-2 h-2 rounded-full bg-fb-border"></span>').join('') +
-            '</div>';
+            '<div class="flex justify-center gap-1.5 mt-3" id="v3-ob-dots"></div>';
 
         const overlay = document.createElement('div');
         overlay.id = 'v3-onboarding';
@@ -403,8 +470,16 @@
             '<span class="block text-xs text-fb-textDim mt-1">Loads your saved tone chain for monitoring. You can change this any time in the desktop Audio settings.</span></span>' +
             '</label>' +
             '<p class="text-xs text-fb-textDim mt-2">Leave it unticked if you monitor through your own gear. This is off by default.</p></div>' +
-            // Step 6 — calibration offer (first-run only).
+            // Step 6 — tune your guitar (only visited when an audio path was
+            // picked; stepSeq is rebuilt in the step-4 handler). The tuner
+            // plugin's panel is embedded into the host div by enterTuneStep()
+            // when this step shows.
             '<div id="v3-ob-step6" class="hidden">' +
+            '<label class="block text-xs uppercase tracking-wider text-fb-textDim mb-2">Tune your guitar</label>' +
+            '<p class="text-sm text-fb-textDim mb-3">Play each string open and match it on the tuner — a tuned guitar makes the calibration challenge (and every later score) far more accurate.</p>' +
+            '<div id="v3-ob-tuner-host" class="rounded-lg border border-fb-border/50 bg-fb-bg/40 p-3 min-h-[14rem]"></div></div>' +
+            // Step 7 — calibration offer (first-run only).
+            '<div id="v3-ob-step7" class="hidden">' +
             '<label class="block text-xs uppercase tracking-wider text-fb-textDim mb-2">Calibration challenge</label>' +
             '<p class="text-sm text-fb-textDim">Prove your setup: play the <span class="text-fb-text">fee[dB]ack Diagnostic</span> with note detection and finish at <span class="text-fb-text font-semibold">100% accuracy</span> to reach <span class="text-fb-text font-semibold">Mastery Rank 1</span>.</p>' +
             '<p class="text-sm text-fb-textDim mt-2">Not ready? Skip it and you’ll start at Rank 1 anyway — you can still play it later from the Progress screen.</p></div>' +
@@ -461,10 +536,27 @@
             }
         }
 
+        // Redraw the step-dot strip from stepSeq (the steps this run visits),
+        // highlighting everything up to the current step.
+        function renderDots() {
+            const wrap = overlay.querySelector('#v3-ob-dots');
+            if (!wrap || editing) return;
+            wrap.innerHTML = stepSeq.map((n) =>
+                '<span data-dot="' + n + '" class="w-2 h-2 rounded-full ' +
+                (n <= step ? 'bg-fb-primary' : 'bg-fb-border') + '"></span>').join('');
+        }
+        // The next step this run actually visits after step n.
+        function nextStepAfter(n) {
+            const idx = stepSeq.indexOf(n);
+            if (idx < 0) return n;
+            return stepSeq[Math.min(idx + 1, stepSeq.length - 1)];
+        }
+
         function setStep(n) {
+            const prev = step;
             step = n;
             errEl.classList.add('hidden');
-            for (let i = 1; i <= 6; i++) {
+            for (let i = 1; i <= 7; i++) {
                 overlay.querySelector('#v3-ob-step' + i).classList.toggle('hidden', i !== n);
             }
             overlay.querySelectorAll('#v3-ob-dots [data-dot]').forEach((d) => {
@@ -478,12 +570,18 @@
                     : n === 3 ? 'Feats of Power (optional)'
                     : n === 4 ? 'Choose your instrument paths'
                     : n === 5 ? 'How do you want to monitor?'
+                    : n === 6 ? 'Tune your guitar'
                     : 'One last thing — calibrate your setup';
             }
-            submit.textContent = n === 6 ? 'Play it now' : 'Next';
-            // Skip is offered on the song-directory step (configure later) and
-            // the calibration challenge (the last step).
-            skipBtn.classList.toggle('hidden', !(n === 2 || n === 6));
+            submit.textContent = n === 7 ? 'Play it now' : 'Next';
+            // Skip is offered on the song-directory step (configure later), the
+            // tuner step (tune later from the player) and the calibration
+            // challenge (the last step).
+            skipBtn.classList.toggle('hidden', !(n === 2 || n === 6 || n === 7));
+            // Mount the embedded tuner when entering step 6, tear it down when
+            // leaving it (whichever direction we cross the boundary).
+            if (prev === 6 && n !== 6) leaveTuneStep();
+            if (n === 6) enterTuneStep(overlay.querySelector('#v3-ob-tuner-host'));
             refreshSubmit();
         }
 
@@ -719,7 +817,15 @@
                     // New step: input-device selection + calibration, between
                     // path selection and the note-detect calibration challenge.
                     await runInputSetup(selectedPaths);
-                    setStep(isDesktop ? 5 : 6);
+                    // Rebuild the remaining steps now that the path picks are
+                    // known: amp sims (desktop only), then the tuner when an
+                    // audio path (guitar/bass) was picked, then the challenge.
+                    stepSeq = [1, 2, 3, 4];
+                    if (isDesktop) stepSeq.push(5);
+                    if (selectedPaths.some((p) => p === 'guitar' || p === 'bass')) stepSeq.push(6);
+                    stepSeq.push(7);
+                    renderDots();
+                    setStep(nextStepAfter(4));
                 } catch (e) { showErr(e.message || 'Could not save profile.'); refreshSubmit(); }
                 return;
             }
@@ -737,11 +843,16 @@
                             body: JSON.stringify({ use_amp_sims: useAmpSims }),
                         });
                     } catch (e) { /* best-effort — settable later */ }
-                    setStep(6);
+                    setStep(nextStepAfter(5));
                 } finally { refreshSubmit(); }
                 return;
             }
-            // Step 6 — "Play it now": leave calibration pending (it completes
+            if (step === 6) {
+                // Tuner step — nothing to persist; advance to the challenge.
+                setStep(nextStepAfter(6));
+                return;
+            }
+            // Step 7 — "Play it now": leave calibration pending (it completes
             // through the normal scored-stats path) and launch the diagnostic.
             const target = diagnosticFilename;
             // The diagnostic song needs a RUNNING, AUDIBLE engine. The
@@ -778,6 +889,10 @@
                 } catch (e) { /* best-effort */ }
             }
             await finish({ launchingSong: !!target });
+            // The note detector installs its playSong wrapper at the very end
+            // of its deferred screen.js — launching before it is ready leaves
+            // detection OFF and the challenge hears nothing on its first run.
+            await waitForNoteDetector(10000);
             if (target && typeof window.playSong === 'function') window.playSong(target);
         });
 
@@ -786,6 +901,11 @@
             // Settings). Proceed to the achievements opt-in.
             if (step === 2) {
                 setStep(3);
+                return;
+            }
+            // Tuner step — skip: tune later from the player.
+            if (step === 6) {
+                setStep(nextStepAfter(6));
                 return;
             }
             // Calibration step (last) — skip: Mastery Rank 1 immediately,
@@ -801,7 +921,7 @@
             await finish();
         });
 
-        if (!editing) setStep(1);
+        if (!editing) { renderDots(); setStep(1); }
         setTimeout(() => nameEl.focus(), 50);
     }
 

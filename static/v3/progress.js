@@ -163,10 +163,7 @@
         const shopBtn = root.querySelector('[data-prog-shop]');
         if (shopBtn) shopBtn.addEventListener('click', () => window.showScreen && window.showScreen('v3-shop'));
         const cal = root.querySelector('[data-prog-calibrate]');
-        if (cal) cal.addEventListener('click', () => {
-            const fn = (st.onboarding || {}).diagnostic_filename;
-            if (fn && typeof window.playSong === 'function') window.playSong(fn);
-        });
+        if (cal) cal.addEventListener('click', () => launchDiagnostic(st.onboarding));
         const skip = root.querySelector('[data-prog-skip]');
         if (skip) skip.addEventListener('click', async () => {
             try {
@@ -191,9 +188,30 @@
         });
     }
 
+    // Wait (bounded) for the note detector plugin to install its playSong
+    // wrapper — that happens at the very end of its (huge, deferred)
+    // screen.js. Launching the diagnostic before the wrapper exists leaves
+    // note detection OFF (nothing re-arms it on song load), so the challenge
+    // hears nothing on its first run and the user has to relaunch it manually.
+    function waitForNoteDetector(timeoutMs) {
+        const ready = () => !!(window.noteDetect
+            && typeof window.noteDetect.injectButton === 'function'
+            && typeof window.playSong === 'function'
+            && window.playSong._ndWrapped === true);
+        return new Promise((resolve) => {
+            if (ready()) { resolve(true); return; }
+            const t0 = Date.now();
+            const iv = setInterval(() => {
+                if (ready()) { clearInterval(iv); resolve(true); }
+                else if (Date.now() - t0 >= timeoutMs) { clearInterval(iv); resolve(false); }
+            }, 100);
+        });
+    }
+
     function launchDiagnostic(onboarding) {
         const fn = (onboarding || {}).diagnostic_filename;
-        if (fn && typeof window.playSong === 'function') window.playSong(fn);
+        if (!fn || typeof window.playSong !== 'function') return;
+        waitForNoteDetector(10000).then(() => { window.playSong(fn); });
     }
 
     function priorCalibrationStatus(detail) {
